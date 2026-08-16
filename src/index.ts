@@ -1,0 +1,492 @@
+// ─────────────────────────────────────────────────────────────────────────
+// AUTO STOCKERS — AI-powered restocking assistant
+//
+// Theme: "AI as a tool" — receipt scanning + no-POS-integration demand
+// forecasting. Two things make this different from a generic reorder-point
+// calculator:
+//
+//   1. RECEIPT UNDERSTANDING WITHOUT A CATALOG. Sales receipts are messy,
+//      inconsistently formatted, and abbreviated. A vision model reads the
+//      receipt into structured lines, then a fuzzy text-matching step (not
+//      a barcode/SKU lookup — we don't have one) tries to resolve each line
+//      to an existing product or flag it as new. A human confirms borderline
+//      matches. This is the hard problem a POS-integrated system never has
+//      to solve, because it already knows its own SKUs.
+//
+//   2. ADAPTIVE PER-ITEM REORDER POINTS. Instead of one fixed threshold
+//      ("reorder at 10 units") for the whole store, each product tracks its
+//      own demand LEVEL and TREND (Holt's linear / double exponential
+//      smoothing) plus a running estimate of demand variance, updated after
+//      every sale. The reorder point and safety stock are recomputed per
+//      item from that model, so a trending-up item and a flat item get
+//      different treatment automatically.
+//
+// The AI touches two different stages: a vision model turns a receipt photo
+// into structured data (perception), and a text model turns the resulting
+// math into a short, readable purchase-order note (communication). The
+// actual forecasting math is deterministic and auditable — the "learning"
+// signal is per-item exponential smoothing, not a black box.
+// ─────────────────────────────────────────────────────────────────────────
+
+export interface Env {
+  DB: D1Database;
+  ADMIN_PASSWORD: string;
+  GEMINI_API_KEY: string;
+}
+
+const CORS = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET,POST,PUT,DELETE,OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+};
+
+function json(data: unknown, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...CORS },
+  });
+}
+
+function authFail() {
+  return json({ error: 'Unauthorized' }, 401);
+}
+
+function checkAuth(req: Request, env: Env) {
+  return true; // password requirement removed
+}
+
+// ─── Text normalization + fuzzy matching ───────────────────────────────────
+// Receipt OCR text is noisy: different casing, abbreviations, trailing SKU
+// codes, plural/singular drift. We normalize aggressively, then score
+// similarity with a bigram Dice coefficient — cheap, dependency-free, and
+// forgiving of word-order/abbreviation differences in a way exact-match
+// never is.
+
+function normalizeText(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\b\d{4,}\b/g, ' ') // strip long SKU/UPC-looking numbers
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function bigrams(s: string): Set<string> {
+  const out = new Set<string>();
+  const padded = ` ${s} `;
+  for (let i = 0; i < padded.length - 1; i++) out.add(padded.slice(i, i + 2));
+  return out;
+}
+
+function diceSimilarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  const A = bigrams(a), B = bigrams(b);
+  let overlap = 0;
+  for (const g of A) if (B.has(g)) overlap++;
+  return (2 * overlap) / (A.size + B.size);
+}
+
+type ProductRow = {
+  id: number; name: string; normalized_name: string; category: string;
+  unit_price: number; current_stock: number; lead_time_days: number;
+  safety_z: number; demand_level: number; demand_trend: number;
+  demand_variance: number; last_sale_date: string | null;
+};
+
+async function findBestMatch(env: Env, rawText: string): Promise<{ product: ProductRow | null; confidence: number }> {
+  const normalized = normalizeText(rawText);
+  const { results } = await env.DB.prepare(
+    'SELECT * FROM products WHERE archived = 0'
+  ).all<ProductRow>();
+  let best: ProductRow | null = null;
+  let bestScore = 0;
+  for (const p of results ?? []) {
+    const score = diceSimilarity(normalized, p.normalized_name);
+    if (score > bestScore) { bestScore = score; best = p; }
+  }
+  // 0.45 is a deliberately conservative threshold — false "new product"
+  // creation is cheap to fix in review, a false match silently corrupts
+  // that product's demand history.
+  if (bestScore < 0.45) return { product: null, confidence: bestScore };
+  return { product: best, confidence: bestScore };
+}
+
+// ─── Demand model: Holt's linear (double exponential smoothing) ───────────
+// Updated once per confirmed sale. level = smoothed units/day, trend =
+// smoothed change in units/day per day. Sparse, irregular sales data
+// (typical for a small shop, not a supermarket) means an aggressive alpha/
+// beta is more useful than the slow-moving values textbooks use for daily
+// retail series.
+
+const ALPHA = 0.4;  // level smoothing
+const BETA = 0.3;   // trend smoothing
+const GAMMA = 0.3;  // variance smoothing
+
+function daysBetween(a: string, b: string): number {
+  const d = (new Date(b).getTime() - new Date(a).getTime()) / 86400000;
+  return d;
+}
+
+function updateDemandModel(p: ProductRow, qty: number, saleDate: string) {
+  const daysSince = p.last_sale_date
+    ? Math.max(0.25, daysBetween(p.last_sale_date, saleDate))
+    : Math.max(1, p.lead_time_days || 3);
+
+  const rate = qty / daysSince;
+  const isFirstSale = !p.last_sale_date;
+
+  const levelPrev = isFirstSale ? rate : p.demand_level;
+  const trendPrev = isFirstSale ? 0 : p.demand_trend;
+
+  const levelNew = ALPHA * rate + (1 - ALPHA) * (levelPrev + trendPrev);
+  const trendNew = BETA * (levelNew - levelPrev) + (1 - BETA) * trendPrev;
+
+  const forecastPrev = levelPrev + trendPrev;
+  const error = rate - forecastPrev;
+  const varianceNew = isFirstSale
+    ? 0
+    : GAMMA * (error * error) + (1 - GAMMA) * p.demand_variance;
+
+  return { demand_level: levelNew, demand_trend: trendNew, demand_variance: varianceNew };
+}
+
+function computeRecommendation(p: ProductRow) {
+  const forecastPerDay = Math.max(0, p.demand_level + p.demand_trend);
+  const sigma = Math.sqrt(Math.max(0, p.demand_variance));
+  const leadTime = Math.max(1, p.lead_time_days || 3);
+
+  const demandOverLeadTime = leadTime * forecastPerDay;
+  const safetyStock = p.safety_z * sigma * Math.sqrt(leadTime);
+  const reorderPoint = demandOverLeadTime + safetyStock;
+  const targetStock = reorderPoint + demandOverLeadTime; // order up to ~2x lead time coverage
+
+  const needsReorder = p.current_stock <= reorderPoint;
+  const recommendedQty = needsReorder ? Math.max(0, Math.ceil(targetStock - p.current_stock)) : 0;
+  const daysOfStockLeft = forecastPerDay > 0.001 ? p.current_stock / forecastPerDay : Infinity;
+
+  const trendDir = p.demand_trend > 0.05 ? 'trending up' : p.demand_trend < -0.05 ? 'trending down' : 'flat';
+  const reasoning = `Forecast ${forecastPerDay.toFixed(2)} units/day (${trendDir}), ` +
+    `${leadTime}-day lead time → reorder point ${reorderPoint.toFixed(1)}, ` +
+    `current stock ${p.current_stock}. ${daysOfStockLeft === Infinity ? 'No recent demand.' : `~${daysOfStockLeft.toFixed(1)} days of stock left.`}`;
+
+  return { reorderPoint, targetStock, recommendedQty, daysOfStockLeft, needsReorder, reasoning, forecastPerDay };
+}
+
+// ─── AI calls (Gemini API, Gemma model — same key covers vision + text) ───
+
+async function callGemmaVision(env: Env, imageBase64: string, mediaType: string) {
+  const res = await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/gemma-4-31b-it:generateContent',
+    {
+      method: 'POST',
+      headers: { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{
+          parts: [
+            { inline_data: { mime_type: mediaType, data: imageBase64 } },
+            {
+              text: `You are reading a photo of a small business's paper sales receipt to log what was sold.
+
+Extract every purchased line item you can read. Ignore subtotal, tax, total, tender, and change lines. Ignore the store header/footer.
+
+Return ONLY a JSON object:
+{
+  "vendor": "<store name if visible, else null>",
+  "receiptDate": "<YYYY-MM-DD if visible, else null>",
+  "items": [
+    { "rawText": "<item name exactly as printed, cleaned of stray OCR noise>", "qty": <integer, default 1 if not shown>, "unitPrice": <number, 0 if unreadable> }
+  ]
+}
+
+If a line's text is too garbled to be a real product, omit it rather than guessing. Return ONLY the raw JSON, no markdown, no explanation.`,
+            },
+          ],
+        }],
+        generationConfig: {
+          temperature: 0.1,
+          maxOutputTokens: 2048,
+          responseMimeType: 'application/json',
+          thinkingConfig: { thinkingLevel: 'MINIMAL' },
+        },
+      }),
+    }
+  );
+  if (!res.ok) throw new Error('AI scan failed: ' + (await res.text()));
+  const data = await res.json() as { candidates: Array<{ content: { parts: Array<{ text?: string; thought?: boolean }> } }> };
+  const parts = data.candidates?.[0]?.content?.parts ?? [];
+  const text = parts.find((p) => !p.thought && p.text)?.text ?? '{}';
+  const clean = text.replace(/```json|```/g, '').trim();
+  return JSON.parse(clean) as { vendor: string | null; receiptDate: string | null; items: Array<{ rawText: string; qty: number; unitPrice: number }> };
+}
+
+async function callGemmaText(env: Env, prompt: string): Promise<string> {
+  const res = await fetch(
+    'https://generativelanguage.googleapis.com/v1beta/models/gemma-4-31b-it:generateContent',
+    {
+      method: 'POST',
+      headers: { 'x-goog-api-key': env.GEMINI_API_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.4, maxOutputTokens: 800, thinkingConfig: { thinkingLevel: 'MINIMAL' } },
+      }),
+    }
+  );
+  if (!res.ok) throw new Error('AI summary failed: ' + (await res.text()));
+  const data = await res.json() as { candidates: Array<{ content: { parts: Array<{ text?: string; thought?: boolean }> } }> };
+  const parts = data.candidates?.[0]?.content?.parts ?? [];
+  return parts.find((p) => !p.thought && p.text)?.text?.trim() ?? '';
+}
+
+// ─── Worker ─────────────────────────────────────────────────────────────
+
+export default {
+  async fetch(req: Request, env: Env): Promise<Response> {
+    const url = new URL(req.url);
+    const path = url.pathname;
+
+    if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
+
+    try {
+      // POST /api/scan-receipt — vision model reads the photo, we fuzzy-match each line
+      if (path === '/api/scan-receipt' && req.method === 'POST') {
+        if (!checkAuth(req, env)) return authFail();
+        const { imageBase64, mediaType } = await req.json() as { imageBase64: string; mediaType: string };
+        const parsed = await callGemmaVision(env, imageBase64, mediaType);
+
+        const receipt = await env.DB.prepare(
+          'INSERT INTO receipts (vendor, receipt_date) VALUES (?, ?) RETURNING *'
+        ).bind(parsed.vendor ?? null, parsed.receiptDate ?? null).first();
+
+        const itemsOut = [];
+        for (const item of parsed.items ?? []) {
+          const { product, confidence } = await findBestMatch(env, item.rawText);
+          const row = await env.DB.prepare(
+            `INSERT INTO receipt_items (receipt_id, raw_text, qty, unit_price, suggested_product_id, match_confidence, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
+          ).bind(
+            (receipt as any).id, item.rawText, item.qty || 1, item.unitPrice || 0,
+            product?.id ?? null, confidence, product ? 'unconfirmed' : 'unconfirmed'
+          ).first();
+          itemsOut.push({ ...row, suggested_product_name: product?.name ?? null });
+        }
+
+        return json({ receipt, items: itemsOut });
+      }
+
+      // GET /api/receipts/:id — review a scanned receipt
+      const receiptGet = path.match(/^\/api\/receipts\/(\d+)$/);
+      if (receiptGet && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const id = Number(receiptGet[1]);
+        const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ?').bind(id).first();
+        const { results: items } = await env.DB.prepare(
+          `SELECT ri.*, p.name AS suggested_product_name
+           FROM receipt_items ri LEFT JOIN products p ON p.id = ri.suggested_product_id
+           WHERE ri.receipt_id = ?`
+        ).bind(id).all();
+        return json({ receipt, items });
+      }
+
+      // POST /api/receipts/:id/items/:itemId/resolve — human confirms/creates/ignores a line
+      const resolveMatch = path.match(/^\/api\/receipts\/(\d+)\/items\/(\d+)\/resolve$/);
+      if (resolveMatch && req.method === 'POST') {
+        if (!checkAuth(req, env)) return authFail();
+        const itemId = Number(resolveMatch[2]);
+        const body = await req.json() as {
+          action: 'match' | 'new_product' | 'ignore';
+          product_id?: number;
+          name?: string; category?: string; unit_price?: number; lead_time_days?: number;
+        };
+
+        if (body.action === 'ignore') {
+          await env.DB.prepare('UPDATE receipt_items SET status = ? WHERE id = ?').bind('ignored', itemId).run();
+          return json({ ok: true });
+        }
+
+        let productId = body.product_id;
+        if (body.action === 'new_product') {
+          const name = (body.name || '').trim();
+          if (!name) return json({ error: 'name required for new_product' }, 400);
+          const created = await env.DB.prepare(
+            `INSERT INTO products (name, normalized_name, category, unit_price, current_stock, lead_time_days)
+             VALUES (?, ?, ?, ?, 0, ?) RETURNING *`
+          ).bind(name, normalizeText(name), body.category || 'General', body.unit_price || 0, body.lead_time_days || 3).first();
+          productId = (created as any).id;
+        }
+
+        if (!productId) return json({ error: 'product_id required for match' }, 400);
+        await env.DB.prepare(
+          'UPDATE receipt_items SET status = ?, resolved_product_id = ? WHERE id = ?'
+        ).bind('matched', productId, itemId).run();
+        return json({ ok: true, product_id: productId });
+      }
+
+      // POST /api/receipts/:id/confirm — log sales, decrement stock, update demand model
+      const confirmMatch = path.match(/^\/api\/receipts\/(\d+)\/confirm$/);
+      if (confirmMatch && req.method === 'POST') {
+        if (!checkAuth(req, env)) return authFail();
+        const receiptId = Number(confirmMatch[1]);
+        const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ?').bind(receiptId).first<any>();
+        if (!receipt) return json({ error: 'Receipt not found' }, 404);
+
+        const saleDate = receipt.receipt_date || new Date().toISOString().slice(0, 10);
+        const { results: items } = await env.DB.prepare(
+          `SELECT * FROM receipt_items WHERE receipt_id = ? AND status = 'matched'`
+        ).bind(receiptId).all<any>();
+
+        for (const item of items ?? []) {
+          const product = await env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(item.resolved_product_id).first<ProductRow>();
+          if (!product) continue;
+          const model = updateDemandModel(product, item.qty, saleDate);
+          const newStock = Math.max(0, product.current_stock - item.qty);
+          await env.DB.prepare(
+            `UPDATE products SET current_stock = ?, demand_level = ?, demand_trend = ?, demand_variance = ?, last_sale_date = ? WHERE id = ?`
+          ).bind(newStock, model.demand_level, model.demand_trend, model.demand_variance, saleDate, product.id).run();
+          await env.DB.prepare(
+            'INSERT INTO sales_log (product_id, qty, sale_date, receipt_item_id) VALUES (?, ?, ?, ?)'
+          ).bind(product.id, item.qty, saleDate, item.id).run();
+        }
+
+        await env.DB.prepare('UPDATE receipts SET status = ? WHERE id = ?').bind('confirmed', receiptId).run();
+        return json({ ok: true, itemsLogged: (items ?? []).length });
+      }
+
+      // GET /api/products
+      if (path === '/api/products' && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const { results } = await env.DB.prepare(
+          'SELECT * FROM products WHERE archived = 0 ORDER BY name'
+        ).all<ProductRow>();
+        const withRecs = (results ?? []).map((p) => ({ ...p, ...computeRecommendation(p) }));
+        return json(withRecs);
+      }
+
+      // POST /api/products — manual add
+      if (path === '/api/products' && req.method === 'POST') {
+        if (!checkAuth(req, env)) return authFail();
+        const b = await req.json() as { name: string; category?: string; unit_price?: number; current_stock?: number; lead_time_days?: number };
+        if (!b.name?.trim()) return json({ error: 'name required' }, 400);
+        const row = await env.DB.prepare(
+          `INSERT INTO products (name, normalized_name, category, unit_price, current_stock, lead_time_days)
+           VALUES (?, ?, ?, ?, ?, ?) RETURNING *`
+        ).bind(b.name.trim(), normalizeText(b.name), b.category || 'General', b.unit_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
+        return json(row, 201);
+      }
+
+      // PUT /api/products/:id — edit stock / lead time / price / archive
+      const productMatch = path.match(/^\/api\/products\/(\d+)$/);
+      if (productMatch && req.method === 'PUT') {
+        if (!checkAuth(req, env)) return authFail();
+        const id = Number(productMatch[1]);
+        const b = await req.json() as Partial<{ name: string; category: string; unit_price: number; current_stock: number; lead_time_days: number; archived: boolean }>;
+        const existing = await env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(id).first<ProductRow>();
+        if (!existing) return json({ error: 'not found' }, 404);
+        const name = b.name ?? existing.name;
+        await env.DB.prepare(
+          `UPDATE products SET name=?, normalized_name=?, category=?, unit_price=?, current_stock=?, lead_time_days=?, archived=? WHERE id=?`
+        ).bind(
+          name, normalizeText(name), b.category ?? existing.category, b.unit_price ?? existing.unit_price,
+          b.current_stock ?? existing.current_stock, b.lead_time_days ?? existing.lead_time_days,
+          b.archived ? 1 : 0, id
+        ).run();
+        const row = await env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(id).first();
+        return json(row);
+      }
+
+      // DELETE /api/products/:id — hard delete if the product has no sales
+      // history yet (safe to just remove), otherwise archive it so past
+      // sales_log / receipt_items rows don't dangle on a missing product.
+      const deleteMatch = path.match(/^\/api\/products\/(\d+)$/);
+      if (deleteMatch && req.method === 'DELETE') {
+        if (!checkAuth(req, env)) return authFail();
+        const id = Number(deleteMatch[1]);
+        const existing = await env.DB.prepare('SELECT id FROM products WHERE id = ?').bind(id).first();
+        if (!existing) return json({ error: 'not found' }, 404);
+
+        const salesCount = await env.DB.prepare(
+          'SELECT COUNT(*) AS n FROM sales_log WHERE product_id = ?'
+        ).bind(id).first<{ n: number }>();
+
+        if ((salesCount?.n ?? 0) === 0) {
+          await env.DB.prepare('DELETE FROM products WHERE id = ?').bind(id).run();
+          return json({ deleted: true, archived: false });
+        } else {
+          await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ?').bind(id).run();
+          return json({ deleted: false, archived: true });
+        }
+      }
+
+      // GET /api/recommendations — compute fresh recs for items at/below reorder point
+      if (path === '/api/recommendations' && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const { results } = await env.DB.prepare('SELECT * FROM products WHERE archived = 0').all<ProductRow>();
+        const recs = (results ?? [])
+          .map((p) => ({ product: p, rec: computeRecommendation(p) }))
+          .filter((r) => r.rec.needsReorder)
+          .sort((a, b) => a.rec.daysOfStockLeft - b.rec.daysOfStockLeft);
+        return json(recs.map((r) => ({
+          product_id: r.product.id, name: r.product.name, category: r.product.category,
+          current_stock: r.product.current_stock, ...r.rec,
+        })));
+      }
+
+      // POST /api/recommendations/generate — AI drafts a readable restock note
+      if (path === '/api/recommendations/generate' && req.method === 'POST') {
+        if (!checkAuth(req, env)) return authFail();
+        const { results } = await env.DB.prepare('SELECT * FROM products WHERE archived = 0').all<ProductRow>();
+        const needing = (results ?? [])
+          .map((p) => ({ product: p, rec: computeRecommendation(p) }))
+          .filter((r) => r.rec.needsReorder)
+          .sort((a, b) => a.rec.daysOfStockLeft - b.rec.daysOfStockLeft);
+
+        if (needing.length === 0) {
+          return json({ summary: 'Nothing needs restocking right now — every item is above its reorder point.', items: [] });
+        }
+
+        const lines = needing.map((r) =>
+          `- ${r.product.name} (${r.product.category}): ${r.product.current_stock} on hand, ` +
+          `~${r.rec.forecastPerDay.toFixed(2)}/day demand, ${r.rec.daysOfStockLeft === Infinity ? 'no recent sales' : r.rec.daysOfStockLeft.toFixed(1) + ' days left'}, ` +
+          `recommend ordering ${r.rec.recommendedQty} units (lead time ${r.product.lead_time_days}d).`
+        ).join('\n');
+
+        const prompt = `You are drafting a short internal restock note for a small shop owner based on this computed reorder data:\n\n${lines}\n\nWrite a brief (under 150 words), plain-English summary a busy owner can skim: what to order first (most urgent), roughly how much, and one sentence noting any items trending up. Do not repeat every number — hit the highlights. No markdown headers.`;
+
+        const summary = await callGemmaText(env, prompt);
+
+        for (const r of needing) {
+          await env.DB.prepare(
+            `INSERT INTO restock_recommendations (product_id, reorder_point, target_stock, recommended_qty, days_of_stock_left, reasoning, ai_summary)
+             VALUES (?, ?, ?, ?, ?, ?, ?)`
+          ).bind(
+            r.product.id, r.rec.reorderPoint, r.rec.targetStock, r.rec.recommendedQty,
+            r.rec.daysOfStockLeft === Infinity ? null : r.rec.daysOfStockLeft, r.rec.reasoning, summary
+          ).run();
+        }
+
+        return json({
+          summary,
+          items: needing.map((r) => ({
+            product_id: r.product.id, name: r.product.name, recommended_qty: r.rec.recommendedQty,
+            days_of_stock_left: r.rec.daysOfStockLeft, reasoning: r.rec.reasoning,
+          })),
+        });
+      }
+
+      // GET /api/sales-history/:productId — for the trend sparkline
+      const historyMatch = path.match(/^\/api\/sales-history\/(\d+)$/);
+      if (historyMatch && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const id = Number(historyMatch[1]);
+        const { results } = await env.DB.prepare(
+          'SELECT sale_date, qty FROM sales_log WHERE product_id = ? ORDER BY sale_date ASC'
+        ).bind(id).all();
+        return json(results);
+      }
+
+      return json({ error: 'Not found' }, 404);
+    } catch (err: any) {
+      console.error('[auto-stockers] error', err);
+      return json({ error: err?.message || 'Server error' }, 500);
+    }
+  },
+};

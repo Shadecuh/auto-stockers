@@ -1,0 +1,502 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Auto Stockers</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0b0d10;
+    --panel: #14171c;
+    --panel-2: #1b1f26;
+    --border: #262b33;
+    --amber: #f5a623;
+    --amber-dim: #8a5f14;
+    --green: #3ddc84;
+    --red: #ff5c5c;
+    --text: #e7e9ec;
+    --text-dim: #8b93a1;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    min-height: 100vh;
+  }
+  h1, h2, h3, .display { font-family: 'Space Grotesk', sans-serif; }
+
+  /* ── Login gate ─────────────────────────────────────────── */
+  #login-screen {
+    min-height: 100vh; display: flex; align-items: center; justify-content: center;
+    flex-direction: column; gap: 16px; padding: 20px;
+  }
+  #login-screen .logo { font-size: 2rem; font-weight: 700; letter-spacing: -1px; }
+  #login-screen .logo span { color: var(--amber); }
+  #login-screen input {
+    background: var(--panel); border: 1px solid var(--border); color: var(--text);
+    padding: 12px 14px; border-radius: 8px; font-family: inherit; font-size: 1rem; width: 260px;
+  }
+  #login-screen button, .btn {
+    background: var(--amber); color: #1a1200; border: none; padding: 12px 18px;
+    border-radius: 8px; font-family: 'Space Grotesk', sans-serif; font-weight: 700;
+    cursor: pointer; font-size: 0.95rem; transition: transform .1s, opacity .15s;
+  }
+  #login-screen button:hover, .btn:hover { transform: translateY(-1px); }
+  .btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
+  .btn.small { padding: 6px 12px; font-size: 0.8rem; }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
+  #login-error { color: var(--red); font-size: 0.85rem; min-height: 1em; }
+
+  /* ── App shell ──────────────────────────────────────────── */
+  #app { display: none; }
+  header.top {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 16px 24px; border-bottom: 1px solid var(--border);
+    background: linear-gradient(180deg, #101318, #0b0d10);
+    position: sticky; top: 0; z-index: 10;
+  }
+  header.top .logo { font-size: 1.3rem; font-weight: 700; }
+  header.top .logo span { color: var(--amber); }
+  header.top .logo small { color: var(--text-dim); font-weight: 400; font-size: 0.65rem; display: block; margin-top: 2px; letter-spacing: 1px; }
+
+  nav.tabs { display: flex; gap: 4px; padding: 12px 24px 0; border-bottom: 1px solid var(--border); }
+  nav.tabs button {
+    background: none; border: none; color: var(--text-dim); font-family: 'Space Grotesk', sans-serif;
+    font-weight: 700; padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 0.9rem;
+  }
+  nav.tabs button.active { color: var(--amber); border-bottom-color: var(--amber); }
+
+  main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+  .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
+  .panel h3 { margin: 0 0 12px; font-size: 1rem; color: var(--text); }
+  .muted { color: var(--text-dim); font-size: 0.85rem; }
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  /* ── Scan tab ───────────────────────────────────────────── */
+  #dropzone {
+    border: 2px dashed var(--amber-dim); border-radius: 12px; padding: 40px 20px;
+    text-align: center; cursor: pointer; position: relative; overflow: hidden;
+    transition: border-color .2s;
+  }
+  #dropzone:hover { border-color: var(--amber); }
+  #dropzone .scanline {
+    position: absolute; left: 0; right: 0; height: 2px; background: var(--amber);
+    box-shadow: 0 0 12px var(--amber); top: 0; opacity: 0; pointer-events: none;
+  }
+  #dropzone.scanning .scanline { opacity: 1; animation: scan 1.4s linear infinite; }
+  @keyframes scan { 0% { top: 0; } 100% { top: 100%; } }
+  #dropzone .icon { font-size: 2.2rem; margin-bottom: 8px; }
+  #receipt-preview { max-width: 220px; max-height: 220px; border-radius: 8px; margin-top: 12px; display: none; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 0.85rem; }
+  th { text-align: left; color: var(--text-dim); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.5px; }
+  td { padding: 8px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  select, input[type=text], input[type=number] {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 6px 8px; border-radius: 6px; font-family: inherit; font-size: 0.82rem; width: 100%;
+  }
+  .badge { display: inline-block; padding: 3px 8px; border-radius: 20px; font-size: 0.7rem; font-weight: 700; letter-spacing: 0.3px; }
+  .badge.ok { background: rgba(61,220,132,.15); color: var(--green); }
+  .badge.low { background: rgba(245,166,35,.15); color: var(--amber); }
+  .badge.critical { background: rgba(255,92,92,.15); color: var(--red); }
+  .row-actions { display: flex; gap: 6px; }
+
+  /* ── Inventory tab ──────────────────────────────────────── */
+  .stock-bar { height: 6px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin-top: 4px; width: 90px; }
+  .stock-bar > div { height: 100%; }
+  .trend { font-size: 0.75rem; }
+  .trend.up { color: var(--green); }
+  .trend.down { color: var(--red); }
+  .trend.flat { color: var(--text-dim); }
+
+  /* ── Recommendations tab ───────────────────────────────── */
+  #ai-summary {
+    background: var(--panel-2); border-left: 3px solid var(--amber); border-radius: 6px;
+    padding: 16px; line-height: 1.6; font-size: 0.9rem; white-space: pre-wrap;
+  }
+  .rec-item { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid var(--border); }
+  .rec-item:last-child { border-bottom: none; }
+  .rec-item .name { font-weight: 700; }
+  .rec-item .meta { font-size: 0.75rem; color: var(--text-dim); }
+  .rec-qty { color: var(--amber); font-weight: 700; font-size: 1.1rem; }
+
+  .empty { text-align: center; color: var(--text-dim); padding: 30px 10px; font-size: 0.85rem; }
+  .toolbar { display: flex; gap: 10px; align-items: center; margin-bottom: 14px; flex-wrap: wrap; }
+  .toolbar input { max-width: 200px; }
+  footer { text-align: center; padding: 30px; color: var(--text-dim); font-size: 0.75rem; }
+</style>
+</head>
+<body>
+
+<div id="login-screen">
+  <div class="logo">AUTO <span>STOCKERS</span></div>
+  <div class="muted">AI-powered restocking assistant</div>
+  <input type="password" id="login-password" placeholder="Admin password" />
+  <button onclick="login()">Enter</button>
+  <div id="login-error"></div>
+</div>
+
+<div id="app">
+  <header class="top">
+    <div class="logo">AUTO <span>STOCKERS</span><small>NO-POS RESTOCK ENGINE</small></div>
+    <button class="btn secondary small" onclick="logout()">Log out</button>
+  </header>
+
+  <nav class="tabs">
+    <button class="tab-btn active" data-tab="scan">Scan Receipt</button>
+    <button class="tab-btn" data-tab="inventory">Inventory</button>
+    <button class="tab-btn" data-tab="recs">Recommendations</button>
+  </nav>
+
+  <main>
+    <!-- SCAN TAB -->
+    <div class="tab-content active" id="tab-scan">
+      <div class="panel">
+        <h3>1. Upload a receipt photo</h3>
+        <p class="muted">The vision model reads line items off the receipt, then we fuzzy-match each one against your existing inventory. Nothing touches stock until you confirm below.</p>
+        <div id="dropzone" onclick="document.getElementById('file-input').click()">
+          <div class="scanline"></div>
+          <div class="icon">🧾</div>
+          <div id="dropzone-label">Tap to choose or take a photo</div>
+          <img id="receipt-preview" />
+        </div>
+        <input type="file" id="file-input" accept="image/*" capture="environment" style="display:none" onchange="handleFile(event)">
+      </div>
+
+      <div class="panel" id="review-panel" style="display:none">
+        <h3>2. Confirm what was matched</h3>
+        <p class="muted" id="receipt-meta"></p>
+        <table>
+          <thead><tr><th>Receipt text</th><th>Qty</th><th>Match</th><th></th></tr></thead>
+          <tbody id="review-rows"></tbody>
+        </table>
+        <div style="margin-top:16px; display:flex; gap:10px;">
+          <button class="btn" onclick="confirmReceipt()">Confirm & log sales</button>
+          <span class="muted" id="confirm-status"></span>
+        </div>
+      </div>
+    </div>
+
+    <!-- INVENTORY TAB -->
+    <div class="tab-content" id="tab-inventory">
+      <div class="panel">
+        <div class="toolbar">
+          <h3 style="margin:0">Products</h3>
+          <button class="btn small" style="margin-left:auto" onclick="showAddProduct()">+ Add product</button>
+        </div>
+        <div id="add-product-form" style="display:none; margin-bottom:16px; padding:14px; background:var(--panel-2); border-radius:8px;">
+          <div style="display:grid; grid-template-columns:2fr 1fr 1fr 1fr auto; gap:8px;">
+            <input type="text" id="np-name" placeholder="Name">
+            <input type="text" id="np-category" placeholder="Category">
+            <input type="number" id="np-price" placeholder="Unit price" step="0.01">
+            <input type="number" id="np-stock" placeholder="Current stock">
+            <button class="btn small" onclick="addProduct()">Add</button>
+          </div>
+        </div>
+        <table>
+          <thead><tr><th>Item</th><th>Stock</th><th>Demand</th><th>Status</th><th>Lead time</th><th></th></tr></thead>
+          <tbody id="product-rows"></tbody>
+        </table>
+        <div class="empty" id="product-empty" style="display:none">No products yet — scan a receipt or add one manually.</div>
+      </div>
+    </div>
+
+    <!-- RECOMMENDATIONS TAB -->
+    <div class="tab-content" id="tab-recs">
+      <div class="panel">
+        <div class="toolbar">
+          <h3 style="margin:0">Restock recommendations</h3>
+          <button class="btn small" style="margin-left:auto" onclick="generateRecs()">Generate AI note</button>
+        </div>
+        <div id="ai-summary" style="display:none"></div>
+        <div id="rec-list" style="margin-top:16px"></div>
+        <div class="empty" id="rec-empty">Nothing computed yet — click "Generate AI note".</div>
+      </div>
+    </div>
+  </main>
+
+  <footer>Auto Stockers — receipt OCR + adaptive per-item reorder points, no POS integration required.</footer>
+</div>
+
+<script>
+const API_BASE = ''; // same-origin: Worker serves this file and the /api/* routes
+
+let PASSWORD = localStorage.getItem('as_pw') || '';
+let currentReceipt = null;
+let currentItems = [];
+let allProducts = [];
+
+function authHeaders() {
+  return { 'Authorization': 'Bearer ' + PASSWORD, 'Content-Type': 'application/json' };
+}
+
+async function api(path, opts = {}) {
+  const res = await fetch(API_BASE + path, { ...opts, headers: { ...authHeaders(), ...(opts.headers || {}) } });
+  if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || 'Request failed'); }
+  return res.json();
+}
+
+function login() {
+  const val = document.getElementById('login-password').value;
+  PASSWORD = val;
+  api('/api/products').then(() => {
+    localStorage.setItem('as_pw', val);
+    document.getElementById('login-screen').style.display = 'none';
+    document.getElementById('app').style.display = 'block';
+    loadProducts();
+  }).catch(() => {
+    document.getElementById('login-error').textContent = 'Incorrect password.';
+  });
+}
+
+function logout() {
+  localStorage.removeItem('as_pw');
+  location.reload();
+}
+
+document.getElementById('login-screen').style.display = 'none';
+document.getElementById('app').style.display = 'block';
+loadProducts();
+
+// ── Tabs ──────────────────────────────────────────────────────────────
+document.querySelectorAll('.tab-btn').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.tab-btn').forEach((b) => b.classList.remove('active'));
+    document.querySelectorAll('.tab-content').forEach((c) => c.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
+    if (btn.dataset.tab === 'inventory') loadProducts();
+  });
+});
+
+// ── Scan flow ─────────────────────────────────────────────────────────
+function fileToBase64(file) {
+  return new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(',')[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+}
+
+async function handleFile(e) {
+  const file = e.target.files[0];
+  if (!file) return;
+  const preview = document.getElementById('receipt-preview');
+  preview.src = URL.createObjectURL(file);
+  preview.style.display = 'block';
+  document.getElementById('dropzone-label').textContent = 'Scanning receipt…';
+  document.getElementById('dropzone').classList.add('scanning');
+
+  try {
+    const base64 = await fileToBase64(file);
+    const data = await api('/api/scan-receipt', {
+      method: 'POST',
+      body: JSON.stringify({ imageBase64: base64, mediaType: file.type || 'image/jpeg' }),
+    });
+    currentReceipt = data.receipt;
+    currentItems = data.items;
+    await loadProductsQuietly();
+    renderReview();
+    document.getElementById('dropzone-label').textContent = 'Tap to scan another receipt';
+  } catch (err) {
+    document.getElementById('dropzone-label').textContent = 'Scan failed — tap to retry';
+    alert(err.message);
+  } finally {
+    document.getElementById('dropzone').classList.remove('scanning');
+  }
+}
+
+async function loadProductsQuietly() {
+  try { allProducts = await api('/api/products'); } catch {}
+}
+
+function renderReview() {
+  const panel = document.getElementById('review-panel');
+  panel.style.display = 'block';
+  document.getElementById('receipt-meta').textContent =
+    (currentReceipt.vendor || 'Unknown vendor') + ' · ' + (currentReceipt.receipt_date || 'date unread') +
+    ' · ' + currentItems.length + ' line item(s)';
+
+  const rows = document.getElementById('review-rows');
+  rows.innerHTML = '';
+  currentItems.forEach((item) => {
+    const tr = document.createElement('tr');
+    tr.dataset.itemId = item.id;
+
+    const options = allProducts.map((p) =>
+      `<option value="${p.id}" ${p.id === item.suggested_product_id ? 'selected' : ''}>${p.name}</option>`
+    ).join('');
+
+    const confPct = Math.round((item.match_confidence || 0) * 100);
+    tr.innerHTML = `
+      <td>${item.raw_text}</td>
+      <td><input type="number" value="${item.qty}" min="1" style="width:60px" data-role="qty"></td>
+      <td>
+        <select data-role="match">
+          <option value="">— new product —</option>
+          ${options}
+        </select>
+        ${item.suggested_product_id ? `<div class="muted" style="margin-top:3px">${confPct}% match</div>` : `<div class="muted" style="margin-top:3px">no close match</div>`}
+        <input type="text" data-role="new-name" placeholder="New product name" style="margin-top:6px; ${item.suggested_product_id ? 'display:none' : ''}" value="${item.suggested_product_id ? '' : item.raw_text}">
+      </td>
+      <td>
+        <div class="row-actions">
+          <button class="btn small" onclick="resolveItem(${item.id}, this)">Confirm</button>
+          <button class="btn small secondary" onclick="ignoreItem(${item.id}, this)">Ignore</button>
+        </div>
+      </td>
+    `;
+    const select = tr.querySelector('[data-role="match"]');
+    const newNameInput = tr.querySelector('[data-role="new-name"]');
+    select.addEventListener('change', () => {
+      newNameInput.style.display = select.value ? 'none' : 'block';
+    });
+    rows.appendChild(tr);
+  });
+}
+
+async function resolveItem(itemId, btn) {
+  const tr = btn.closest('tr');
+  const select = tr.querySelector('[data-role="match"]');
+  const newName = tr.querySelector('[data-role="new-name"]').value;
+  const body = select.value
+    ? { action: 'match', product_id: Number(select.value) }
+    : { action: 'new_product', name: newName };
+  try {
+    await api(`/api/receipts/${currentReceipt.id}/items/${itemId}/resolve`, { method: 'POST', body: JSON.stringify(body) });
+    btn.textContent = '✓ Confirmed';
+    btn.disabled = true;
+    tr.closest('tr').querySelectorAll('button').forEach((b) => b !== btn && (b.disabled = true));
+  } catch (err) { alert(err.message); }
+}
+
+async function ignoreItem(itemId, btn) {
+  await api(`/api/receipts/${currentReceipt.id}/items/${itemId}/resolve`, { method: 'POST', body: JSON.stringify({ action: 'ignore' }) });
+  btn.closest('tr').style.opacity = '0.4';
+  btn.closest('tr').querySelectorAll('button').forEach((b) => (b.disabled = true));
+}
+
+async function confirmReceipt() {
+  const status = document.getElementById('confirm-status');
+  status.textContent = 'Logging sales…';
+  try {
+    const res = await api(`/api/receipts/${currentReceipt.id}/confirm`, { method: 'POST' });
+    status.textContent = `Logged ${res.itemsLogged} item(s) — stock and demand forecasts updated.`;
+  } catch (err) { status.textContent = 'Error: ' + err.message; }
+}
+
+// ── Inventory ─────────────────────────────────────────────────────────
+async function loadProducts() {
+  try {
+    const data = await api('/api/products');
+    allProducts = data;
+    renderProducts(data);
+  } catch (err) { console.error(err); }
+}
+
+function renderProducts(products) {
+  const rows = document.getElementById('product-rows');
+  const empty = document.getElementById('product-empty');
+  rows.innerHTML = '';
+  if (!products.length) { empty.style.display = 'block'; return; }
+  empty.style.display = 'none';
+
+  products.forEach((p) => {
+    const badge = p.needsReorder
+      ? (p.current_stock === 0 ? '<span class="badge critical">OUT</span>' : '<span class="badge low">REORDER</span>')
+      : '<span class="badge ok">OK</span>';
+    const trendClass = p.demand_trend > 0.05 ? 'up' : p.demand_trend < -0.05 ? 'down' : 'flat';
+    const trendArrow = trendClass === 'up' ? '↑' : trendClass === 'down' ? '↓' : '→';
+    const barPct = Math.min(100, Math.max(4, (p.current_stock / Math.max(1, p.targetStock || p.current_stock || 1)) * 100));
+    const barColor = p.needsReorder ? (p.current_stock === 0 ? 'var(--red)' : 'var(--amber)') : 'var(--green)';
+
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><strong>${p.name}</strong><div class="muted">${p.category}</div></td>
+      <td>${p.current_stock}<div class="stock-bar"><div style="width:${barPct}%; background:${barColor}"></div></div></td>
+      <td><span class="trend ${trendClass}">${trendArrow} ${p.forecastPerDay.toFixed(2)}/day</span></td>
+      <td>${badge}</td>
+      <td>${p.lead_time_days}d</td>
+      <td><button class="btn small secondary" onclick="deleteProduct(${p.id}, this)">Delete</button></td>
+    `;
+    rows.appendChild(tr);
+  });
+}
+
+async function deleteProduct(id, btn) {
+  if (!confirm('Delete this product? If it has sales history it will be archived instead of removed.')) return;
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await api(`/api/products/${id}`, { method: 'DELETE' });
+    loadProducts();
+  } catch (err) {
+    alert(err.message);
+    btn.disabled = false;
+    btn.textContent = 'Delete';
+  }
+}
+
+function showAddProduct() {
+  const f = document.getElementById('add-product-form');
+  f.style.display = f.style.display === 'none' ? 'block' : 'none';
+}
+
+async function addProduct() {
+  const name = document.getElementById('np-name').value.trim();
+  if (!name) return;
+  await api('/api/products', {
+    method: 'POST',
+    body: JSON.stringify({
+      name,
+      category: document.getElementById('np-category').value || 'General',
+      unit_price: Number(document.getElementById('np-price').value) || 0,
+      current_stock: Number(document.getElementById('np-stock').value) || 0,
+    }),
+  });
+  document.getElementById('np-name').value = '';
+  document.getElementById('np-category').value = '';
+  document.getElementById('np-price').value = '';
+  document.getElementById('np-stock').value = '';
+  document.getElementById('add-product-form').style.display = 'none';
+  loadProducts();
+}
+
+// ── Recommendations ──────────────────────────────────────────────────
+async function generateRecs() {
+  const summaryBox = document.getElementById('ai-summary');
+  const list = document.getElementById('rec-list');
+  const empty = document.getElementById('rec-empty');
+  summaryBox.style.display = 'block';
+  summaryBox.textContent = 'Thinking through what to reorder…';
+  empty.style.display = 'none';
+  try {
+    const data = await api('/api/recommendations/generate', { method: 'POST' });
+    summaryBox.textContent = data.summary;
+    list.innerHTML = '';
+    if (!data.items.length) { empty.style.display = 'block'; empty.textContent = 'Nothing needs restocking right now.'; }
+    data.items.forEach((r) => {
+      const div = document.createElement('div');
+      div.className = 'rec-item';
+      div.innerHTML = `
+        <div>
+          <div class="name">${r.name}</div>
+          <div class="meta">${r.days_of_stock_left === null ? 'no recent sales data' : r.days_of_stock_left.toFixed(1) + ' days of stock left'}</div>
+        </div>
+        <div class="rec-qty">+${r.recommended_qty}</div>
+      `;
+      list.appendChild(div);
+    });
+  } catch (err) {
+    summaryBox.textContent = 'Error generating recommendations: ' + err.message;
+  }
+}
+</script>
+</body>
+</html>

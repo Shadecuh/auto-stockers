@@ -1,0 +1,21 @@
+name = "auto-stockers"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+
+# Serves everything in /public automatically. Only requests matching
+# run_worker_first go to the Worker code in src/index.ts — that's our
+# /api/* routes. Everything else (index.html, etc.) is served as a static
+# asset with zero code on your end.
+[assets]
+directory = "./public"
+binding = "ASSETS"
+run_worker_first = ["/api/*"]
+
+[[d1_databases]]
+binding = "DB"
+database_name = "auto-stockers-db"
+database_id = "01acbe8f-d2a1-403b-abe8-84233517e54e"
+
+# Secrets (set with `wrangler secret put <NAME>`, never in this file):
+#   ADMIN_PASSWORD
+#   GEMINI_API_KEY
