@@ -150,6 +150,7 @@
     <button class="tab-btn active" data-tab="scan">Scan Receipt</button>
     <button class="tab-btn" data-tab="inventory">Inventory</button>
     <button class="tab-btn" data-tab="recs">Recommendations</button>
+    <button class="tab-btn" data-tab="calendar">Calendar</button>
   </nav>
 
   <main>
@@ -217,6 +218,25 @@
         <div class="empty" id="rec-empty">Nothing computed yet — click "Generate AI note".</div>
       </div>
     </div>
+    <!-- CALENDAR TAB -->
+    <div class="tab-content" id="tab-calendar">
+      <div class="panel">
+        <h3>Google Calendar</h3>
+        <p class="muted">Connecting your calendar lets recommendations account for upcoming events — a game night or festival can bump expected demand for relevant categories before it shows up in sales history.</p>
+        <div id="cal-disconnected">
+          <button class="btn" onclick="connectCalendar()">Connect Google Calendar</button>
+        </div>
+        <div id="cal-connected" style="display:none">
+          <span class="badge ok">Connected</span>
+          <button class="btn secondary small" style="margin-left:10px" onclick="disconnectCalendar()">Disconnect</button>
+        </div>
+      </div>
+      <div class="panel">
+        <h3>Upcoming events (next 21 days)</h3>
+        <div id="cal-events"></div>
+        <div class="empty" id="cal-empty" style="display:none">No upcoming events, or calendar not connected yet.</div>
+      </div>
+    </div>
   </main>
 
   <footer>Auto Stockers — receipt OCR + adaptive per-item reorder points, no POS integration required.</footer>
@@ -271,8 +291,49 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
     btn.classList.add('active');
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'inventory') loadProducts();
+    if (btn.dataset.tab === 'calendar') loadCalendarTab();
   });
 });
+
+// ── Calendar ──────────────────────────────────────────────────────────
+async function loadCalendarTab() {
+  try {
+    const { connected } = await api('/api/calendar/status');
+    document.getElementById('cal-connected').style.display = connected ? 'block' : 'none';
+    document.getElementById('cal-disconnected').style.display = connected ? 'none' : 'block';
+    if (connected) await loadUpcomingEvents();
+  } catch (err) { console.error(err); }
+}
+
+async function connectCalendar() {
+  try {
+    const { url } = await api('/api/calendar/auth-url');
+    window.open(url, '_blank');
+  } catch (err) { alert(err.message); }
+}
+
+async function disconnectCalendar() {
+  if (!confirm('Disconnect Google Calendar? Recommendations will stop factoring in upcoming events.')) return;
+  await api('/api/calendar/disconnect', { method: 'POST' });
+  loadCalendarTab();
+}
+
+async function loadUpcomingEvents() {
+  const list = document.getElementById('cal-events');
+  const empty = document.getElementById('cal-empty');
+  try {
+    const events = await api('/api/calendar/upcoming-events');
+    list.innerHTML = '';
+    if (!events.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    events.forEach((e) => {
+      const div = document.createElement('div');
+      div.className = 'rec-item';
+      div.innerHTML = `<div><div class="name">${e.title}</div></div><div class="meta">${e.start}</div>`;
+      list.appendChild(div);
+    });
+  } catch { empty.style.display = 'block'; }
+}
 
 // ── Scan flow ─────────────────────────────────────────────────────────
 function fileToBase64(file) {
@@ -484,10 +545,14 @@ async function generateRecs() {
     data.items.forEach((r) => {
       const div = document.createElement('div');
       div.className = 'rec-item';
+      const eventNote = r.event_boost
+        ? `<div class="meta" style="color:var(--amber)">📅 ${r.event_boost.reason}</div>`
+        : '';
       div.innerHTML = `
         <div>
           <div class="name">${r.name}</div>
           <div class="meta">${r.days_of_stock_left === null ? 'no recent sales data' : r.days_of_stock_left.toFixed(1) + ' days of stock left'}</div>
+          ${eventNote}
         </div>
         <div class="rec-qty">+${r.recommended_qty}</div>
       `;
