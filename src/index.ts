@@ -1,6 +1,5 @@
 // ─────────────────────────────────────────────────────────────────────────
 // AUTO STOCKERS — AI-powered restocking assistant
-//
 // Theme: "AI as a tool" — receipt scanning + no-POS-integration demand
 // forecasting. Two things make this different from a generic reorder-point
 // calculator:
