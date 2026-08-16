@@ -32,6 +32,9 @@ export interface Env {
   DB: D1Database;
   ADMIN_PASSWORD: string;
   GEMINI_API_KEY: string;
+  GOOGLE_CLIENT_ID: string;
+  GOOGLE_CLIENT_SECRET: string;
+  GOOGLE_REDIRECT_URI: string; // e.g. https://auto-stockers.<subdomain>.workers.dev/api/calendar/callback
 }
 
 const CORS = {
@@ -150,8 +153,9 @@ function updateDemandModel(p: ProductRow, qty: number, saleDate: string) {
   return { demand_level: levelNew, demand_trend: trendNew, demand_variance: varianceNew };
 }
 
-function computeRecommendation(p: ProductRow) {
-  const forecastPerDay = Math.max(0, p.demand_level + p.demand_trend);
+function computeRecommendation(p: ProductRow, eventBoost?: { multiplier: number; reason: string }) {
+  const baseForecast = Math.max(0, p.demand_level + p.demand_trend);
+  const forecastPerDay = baseForecast * (eventBoost?.multiplier ?? 1);
   const sigma = Math.sqrt(Math.max(0, p.demand_variance));
   const leadTime = Math.max(1, p.lead_time_days || 3);
 
@@ -165,11 +169,12 @@ function computeRecommendation(p: ProductRow) {
   const daysOfStockLeft = forecastPerDay > 0.001 ? p.current_stock / forecastPerDay : Infinity;
 
   const trendDir = p.demand_trend > 0.05 ? 'trending up' : p.demand_trend < -0.05 ? 'trending down' : 'flat';
-  const reasoning = `Forecast ${forecastPerDay.toFixed(2)} units/day (${trendDir}), ` +
+  let reasoning = `Forecast ${forecastPerDay.toFixed(2)} units/day (${trendDir}), ` +
     `${leadTime}-day lead time → reorder point ${reorderPoint.toFixed(1)}, ` +
     `current stock ${p.current_stock}. ${daysOfStockLeft === Infinity ? 'No recent demand.' : `~${daysOfStockLeft.toFixed(1)} days of stock left.`}`;
+  if (eventBoost) reasoning += ` Boosted ${eventBoost.multiplier}x — ${eventBoost.reason}`;
 
-  return { reorderPoint, targetStock, recommendedQty, daysOfStockLeft, needsReorder, reasoning, forecastPerDay };
+  return { reorderPoint, targetStock, recommendedQty, daysOfStockLeft, needsReorder, reasoning, forecastPerDay, eventBoost: eventBoost ?? null };
 }
 
 // ─── AI calls (Gemini API, Gemma model — same key covers vision + text) ───
@@ -235,6 +240,142 @@ async function callGemmaText(env: Env, prompt: string): Promise<string> {
   const data = await res.json() as { candidates: Array<{ content: { parts: Array<{ text?: string; thought?: boolean }> } }> };
   const parts = data.candidates?.[0]?.content?.parts ?? [];
   return parts.find((p) => !p.thought && p.text)?.text?.trim() ?? '';
+}
+
+// ─── Google Calendar integration ───────────────────────────────────────────
+// Purpose: a demand spike isn't only visible in past sales — a known upcoming
+// event (a game night, a local festival, a holiday) predicts one before it
+// happens. We read the owner's real Google Calendar, then use Gemma to judge
+// which product categories a given event title is actually likely to affect
+// (a "Staff meeting" shouldn't boost anything; "Super Bowl watch party"
+// should boost beverages/snacks) — this is a genuinely different signal than
+// anything derivable from sales history alone.
+
+const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
+
+async function getSetting(env: Env, key: string): Promise<string | null> {
+  const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
+  return row?.value ?? null;
+}
+
+async function setSetting(env: Env, key: string, value: string) {
+  await env.DB.prepare(
+    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
+  ).bind(key, value).run();
+}
+
+function buildGoogleAuthUrl(env: Env, state: string): string {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID,
+    redirect_uri: env.GOOGLE_REDIRECT_URI,
+    response_type: 'code',
+    scope: GOOGLE_SCOPES,
+    access_type: 'offline',   // required to get a refresh_token
+    prompt: 'consent',        // force refresh_token even on repeat connects
+    state,
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`;
+}
+
+async function exchangeGoogleCode(env: Env, code: string) {
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      code,
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: env.GOOGLE_REDIRECT_URI,
+      grant_type: 'authorization_code',
+    }),
+  });
+  if (!res.ok) throw new Error('Google token exchange failed: ' + (await res.text()));
+  return res.json() as Promise<{ access_token: string; refresh_token?: string; expires_in: number }>;
+}
+
+async function getValidGoogleAccessToken(env: Env): Promise<string | null> {
+  const refreshToken = await getSetting(env, 'google_refresh_token');
+  if (!refreshToken) return null;
+
+  const expiresAt = Number(await getSetting(env, 'google_token_expires_at') ?? '0');
+  const cached = await getSetting(env, 'google_access_token');
+  if (cached && Date.now() < expiresAt - 60_000) return cached;
+
+  const res = await fetch('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: new URLSearchParams({
+      refresh_token: refreshToken,
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      grant_type: 'refresh_token',
+    }),
+  });
+  if (!res.ok) return null; // refresh token revoked/expired — treat as disconnected
+  const data = await res.json() as { access_token: string; expires_in: number };
+  await setSetting(env, 'google_access_token', data.access_token);
+  await setSetting(env, 'google_token_expires_at', String(Date.now() + data.expires_in * 1000));
+  return data.access_token;
+}
+
+type CalendarEvent = { title: string; start: string; end: string };
+
+// Pulls events in the next `daysAhead` days from the primary calendar.
+// Bounded window matches typical reorder lead times — events further out
+// aren't actionable for a restock decision yet.
+async function fetchUpcomingEvents(env: Env, daysAhead = 21): Promise<CalendarEvent[]> {
+  const token = await getValidGoogleAccessToken(env);
+  if (!token) return [];
+
+  const timeMin = new Date().toISOString();
+  const timeMax = new Date(Date.now() + daysAhead * 86400000).toISOString();
+  const params = new URLSearchParams({
+    timeMin, timeMax, singleEvents: 'true', orderBy: 'startTime', maxResults: '50',
+  });
+  const res = await fetch(
+    `https://www.googleapis.com/calendar/v3/calendars/primary/events?${params.toString()}`,
+    { headers: { Authorization: `Bearer ${token}` } }
+  );
+  if (!res.ok) return [];
+  const data = await res.json() as { items?: Array<{ summary?: string; start?: { date?: string; dateTime?: string }; end?: { date?: string; dateTime?: string } }> };
+  return (data.items ?? [])
+    .filter((e) => e.summary)
+    .map((e) => ({
+      title: e.summary!,
+      start: (e.start?.dateTime || e.start?.date || '').slice(0, 10),
+      end: (e.end?.dateTime || e.end?.date || '').slice(0, 10),
+    }));
+}
+
+// Asks Gemma which product categories a set of upcoming events plausibly
+// affects, and by roughly how much — this is the actual "AI" step, not a
+// keyword list. Falls back to no boost (multiplier 1) for anything the
+// model isn't confident about, or if there are no events/categories.
+async function getEventDemandBoosts(
+  env: Env, categories: string[], events: CalendarEvent[]
+): Promise<Record<string, { multiplier: number; reason: string }>> {
+  if (events.length === 0 || categories.length === 0) return {};
+
+  const prompt = `A small shop sells products in these categories: ${categories.join(', ')}.
+
+These events are on the owner's calendar in the next few weeks:
+${events.map((e) => `- "${e.title}" on ${e.start}`).join('\n')}
+
+For each category that a specific event would plausibly increase demand for (e.g. a party/game/holiday event boosting snacks or beverages — ignore generic events like meetings, appointments, or reminders that have no retail demand impact), return a demand multiplier.
+
+Return ONLY a JSON object, no markdown, shaped exactly like:
+{"CategoryName": {"multiplier": 1.4, "reason": "short reason tied to a specific event"}}
+
+Omit any category you're not reasonably confident about. Multipliers should be modest and realistic (1.1 to 2.0 range) — do not inflate.`;
+
+  try {
+    const raw = await callGemmaText(env, prompt);
+    const clean = raw.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(clean);
+    return typeof parsed === 'object' && parsed ? parsed : {};
+  } catch {
+    return {}; // AI parse failure should never break the recommendation flow
+  }
 }
 
 // ─── Worker ─────────────────────────────────────────────────────────────
@@ -351,6 +492,50 @@ export default {
         return json({ ok: true, itemsLogged: (items ?? []).length });
       }
 
+      // GET /api/calendar/auth-url — kicks off the Google OAuth consent flow
+      if (path === '/api/calendar/auth-url' && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const url = buildGoogleAuthUrl(env, crypto.randomUUID());
+        return json({ url });
+      }
+
+      // GET /api/calendar/callback — Google redirects here with ?code=...
+      // (no checkAuth: Google hits this directly, not the frontend fetch())
+      if (path === '/api/calendar/callback' && req.method === 'GET') {
+        const code = url.searchParams.get('code');
+        if (!code) return json({ error: 'missing code' }, 400);
+        const tokens = await exchangeGoogleCode(env, code);
+        if (tokens.refresh_token) await setSetting(env, 'google_refresh_token', tokens.refresh_token);
+        await setSetting(env, 'google_access_token', tokens.access_token);
+        await setSetting(env, 'google_token_expires_at', String(Date.now() + tokens.expires_in * 1000));
+        return new Response(
+          '<html><body style="font-family:sans-serif;text-align:center;padding:40px">Google Calendar connected — you can close this tab.</body></html>',
+          { headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+
+      // GET /api/calendar/status
+      if (path === '/api/calendar/status' && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const connected = !!(await getSetting(env, 'google_refresh_token'));
+        return json({ connected });
+      }
+
+      // POST /api/calendar/disconnect
+      if (path === '/api/calendar/disconnect' && req.method === 'POST') {
+        if (!checkAuth(req, env)) return authFail();
+        await env.DB.prepare('DELETE FROM settings WHERE key IN (?, ?, ?)')
+          .bind('google_refresh_token', 'google_access_token', 'google_token_expires_at').run();
+        return json({ ok: true });
+      }
+
+      // GET /api/calendar/upcoming-events — raw events, for display in the UI
+      if (path === '/api/calendar/upcoming-events' && req.method === 'GET') {
+        if (!checkAuth(req, env)) return authFail();
+        const events = await fetchUpcomingEvents(env);
+        return json(events);
+      }
+
       // GET /api/products
       if (path === '/api/products' && req.method === 'GET') {
         if (!checkAuth(req, env)) return authFail();
@@ -420,8 +605,12 @@ export default {
       if (path === '/api/recommendations' && req.method === 'GET') {
         if (!checkAuth(req, env)) return authFail();
         const { results } = await env.DB.prepare('SELECT * FROM products WHERE archived = 0').all<ProductRow>();
-        const recs = (results ?? [])
-          .map((p) => ({ product: p, rec: computeRecommendation(p) }))
+        const products = results ?? [];
+        const categories = [...new Set(products.map((p) => p.category))];
+        const events = await fetchUpcomingEvents(env);
+        const boosts = await getEventDemandBoosts(env, categories, events);
+        const recs = products
+          .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
           .filter((r) => r.rec.needsReorder)
           .sort((a, b) => a.rec.daysOfStockLeft - b.rec.daysOfStockLeft);
         return json(recs.map((r) => ({
@@ -434,8 +623,12 @@ export default {
       if (path === '/api/recommendations/generate' && req.method === 'POST') {
         if (!checkAuth(req, env)) return authFail();
         const { results } = await env.DB.prepare('SELECT * FROM products WHERE archived = 0').all<ProductRow>();
-        const needing = (results ?? [])
-          .map((p) => ({ product: p, rec: computeRecommendation(p) }))
+        const products = results ?? [];
+        const categories = [...new Set(products.map((p) => p.category))];
+        const events = await fetchUpcomingEvents(env);
+        const boosts = await getEventDemandBoosts(env, categories, events);
+        const needing = products
+          .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
           .filter((r) => r.rec.needsReorder)
           .sort((a, b) => a.rec.daysOfStockLeft - b.rec.daysOfStockLeft);
 
@@ -446,10 +639,11 @@ export default {
         const lines = needing.map((r) =>
           `- ${r.product.name} (${r.product.category}): ${r.product.current_stock} on hand, ` +
           `~${r.rec.forecastPerDay.toFixed(2)}/day demand, ${r.rec.daysOfStockLeft === Infinity ? 'no recent sales' : r.rec.daysOfStockLeft.toFixed(1) + ' days left'}, ` +
-          `recommend ordering ${r.rec.recommendedQty} units (lead time ${r.product.lead_time_days}d).`
+          `recommend ordering ${r.rec.recommendedQty} units (lead time ${r.product.lead_time_days}d)` +
+          `${r.rec.eventBoost ? ` — boosted due to: ${r.rec.eventBoost.reason}` : ''}.`
         ).join('\n');
 
-        const prompt = `You are drafting a short internal restock note for a small shop owner based on this computed reorder data:\n\n${lines}\n\nWrite a brief (under 150 words), plain-English summary a busy owner can skim: what to order first (most urgent), roughly how much, and one sentence noting any items trending up. Do not repeat every number — hit the highlights. No markdown headers.`;
+        const prompt = `You are drafting a short internal restock note for a small shop owner based on this computed reorder data:\n\n${lines}\n\nWrite a brief (under 150 words), plain-English summary a busy owner can skim: what to order first (most urgent), roughly how much, and one sentence noting any items trending up or boosted by an upcoming calendar event. Do not repeat every number — hit the highlights. No markdown headers.`;
 
         const summary = await callGemmaText(env, prompt);
 
@@ -467,7 +661,7 @@ export default {
           summary,
           items: needing.map((r) => ({
             product_id: r.product.id, name: r.product.name, recommended_qty: r.rec.recommendedQty,
-            days_of_stock_left: r.rec.daysOfStockLeft, reasoning: r.rec.reasoning,
+            days_of_stock_left: r.rec.daysOfStockLeft, reasoning: r.rec.reasoning, event_boost: r.rec.eventBoost,
           })),
         });
       }
