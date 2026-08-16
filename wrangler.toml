@@ -16,6 +16,10 @@ binding = "DB"
 database_name = "auto-stockers-db"
 database_id = "01acbe8f-d2a1-403b-abe8-84233517e54e"
 
+[vars]
+GOOGLE_REDIRECT_URI = "https://auto-stockers.smjtech.workers.dev/api/calendar/callback"
+
 # Secrets (set with `wrangler secret put <NAME>`, never in this file):
 #   ADMIN_PASSWORD
 #   GEMINI_API_KEY
+
