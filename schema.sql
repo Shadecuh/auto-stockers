@@ -6,6 +6,7 @@ DROP TABLE IF EXISTS sales_log;
 DROP TABLE IF EXISTS receipt_items;
 DROP TABLE IF EXISTS receipts;
 DROP TABLE IF EXISTS products;
+DROP TABLE IF EXISTS settings;
 
 CREATE TABLE products (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -71,3 +72,11 @@ CREATE TABLE restock_recommendations (
 CREATE INDEX idx_sales_log_product ON sales_log(product_id);
 CREATE INDEX idx_receipt_items_receipt ON receipt_items(receipt_id);
 CREATE INDEX idx_products_normalized ON products(normalized_name);
+
+-- Key/value settings store — currently holds Google Calendar OAuth tokens
+-- (google_refresh_token, google_access_token, google_token_expires_at).
+-- Single-tenant app, so no per-user rows needed.
+CREATE TABLE settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT
+);
