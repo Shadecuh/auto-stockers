@@ -773,17 +773,8 @@ export default {
         const existing = await env.DB.prepare('SELECT id FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first();
         if (!existing) return json({ error: 'not found' }, 404);
 
-        const salesCount = await env.DB.prepare(
-          'SELECT COUNT(*) AS n FROM sales_log WHERE product_id = ? AND company_id = ?'
-        ).bind(id, companyId).first<{ n: number }>();
-
-        if ((salesCount?.n ?? 0) === 0) {
-          await env.DB.prepare('DELETE FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).run();
-          return json({ deleted: true, archived: false });
-        } else {
-          await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ? AND company_id = ?').bind(id, companyId).run();
-          return json({ deleted: false, archived: true });
-        }
+        await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ? AND company_id = ?').bind(id, companyId).run();
+        return json({ deleted: false, archived: true });
       }
 
       // GET /api/recommendations — compute fresh recs for items at/below reorder point
