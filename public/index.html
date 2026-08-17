@@ -88,6 +88,7 @@
     transition: border-color .2s;
   }
   #dropzone:hover { border-color: var(--amber); }
+  #dropzone.drag-over { border-color: var(--amber); background: rgba(245,166,35,.06); }
   #dropzone .scanline {
     position: absolute; left: 0; right: 0; height: 2px; background: var(--amber);
     box-shadow: 0 0 12px var(--amber); top: 0; opacity: 0; pointer-events: none;
@@ -183,14 +184,15 @@
     <div class="tab-content active" id="tab-scan">
       <div class="panel">
         <h3>1. Upload a receipt photo</h3>
-        <p class="muted">The vision model reads line items off the receipt, then we fuzzy-match each one against your existing inventory. Nothing touches stock until you confirm below.</p>
-        <div id="dropzone" onclick="document.getElementById('file-input').click()">
+        <p class="muted">The vision model reads line items off the receipt, then we fuzzy-match each one against your existing inventory. Nothing touches stock until you confirm below. You can tap to choose a file, paste an image (Ctrl/Cmd+V), or drag a photo in from another window.</p>
+        <div id="dropzone" onclick="document.getElementById('file-input').click()"
+             ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">
           <div class="scanline"></div>
           <div class="icon">🧾</div>
-          <div id="dropzone-label">Tap to choose or take a photo</div>
+          <div id="dropzone-label">Tap to choose, paste, or drag in a photo</div>
           <img id="receipt-preview" />
         </div>
-        <input type="file" id="file-input" accept="image/*" capture="environment" style="display:none" onchange="handleFile(event)">
+        <input type="file" id="file-input" accept="image/*" capture="environment" style="display:none" onchange="handleFileInput(event)">
       </div>
 
       <div class="panel" id="review-panel" style="display:none">
@@ -419,9 +421,13 @@ function fileToBase64(file) {
   });
 }
 
-async function handleFile(e) {
-  const file = e.target.files[0];
-  if (!file) return;
+// Single entry point for a receipt image, regardless of how it arrived
+// (file picker, drag-and-drop, or clipboard paste).
+async function processReceiptFile(file) {
+  if (!file || !file.type || !file.type.startsWith('image/')) {
+    alert('That doesn\'t look like an image — please use a photo of the receipt.');
+    return;
+  }
   const preview = document.getElementById('receipt-preview');
   preview.src = URL.createObjectURL(file);
   preview.style.display = 'block';
@@ -446,6 +452,61 @@ async function handleFile(e) {
     document.getElementById('dropzone').classList.remove('scanning');
   }
 }
+
+// File picker (<input type=file> onchange)
+function handleFileInput(e) {
+  const file = e.target.files[0];
+  if (file) processReceiptFile(file);
+  e.target.value = ''; // allow re-selecting the same file twice in a row
+}
+
+// Drag-and-drop onto the dropzone — works for files dragged from another
+// tab/window (e.g. an image open in a browser tab) as well as from disk.
+function handleDragOver(e) {
+  e.preventDefault();
+  document.getElementById('dropzone').classList.add('drag-over');
+}
+
+function handleDragLeave(e) {
+  e.preventDefault();
+  document.getElementById('dropzone').classList.remove('drag-over');
+}
+
+function handleDrop(e) {
+  e.preventDefault();
+  document.getElementById('dropzone').classList.remove('drag-over');
+
+  // A drag from another site (e.g. an <img> in a tab) often arrives as a
+  // URL/HTML string rather than a File — dataTransfer.files only covers
+  // local-disk drags and same-origin image elements with real File data.
+  const file = e.dataTransfer.files && e.dataTransfer.files[0];
+  if (file) { processReceiptFile(file); return; }
+
+  const html = e.dataTransfer.getData('text/html');
+  const urlMatch = html && html.match(/<img[^>]+src="([^"]+)"/i);
+  const imgUrl = (urlMatch && urlMatch[1]) || e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+  if (imgUrl && /^https?:\/\//.test(imgUrl)) {
+    fetch(imgUrl)
+      .then((r) => r.blob())
+      .then((blob) => processReceiptFile(new File([blob], 'dropped-image', { type: blob.type })))
+      .catch(() => alert('Could not load that dragged image — try saving it and using the file picker instead.'));
+  }
+}
+
+// Clipboard paste (Ctrl/Cmd+V) anywhere on the page, while the Scan tab is active
+document.addEventListener('paste', (e) => {
+  const scanTabActive = document.getElementById('tab-scan').classList.contains('active');
+  if (!scanTabActive) return;
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const item of items) {
+    if (item.type && item.type.startsWith('image/')) {
+      const file = item.getAsFile();
+      if (file) { processReceiptFile(file); e.preventDefault(); break; }
+    }
+  }
+});
+
 
 async function loadProductsQuietly() {
   try { allProducts = await api('/api/products'); } catch {}
