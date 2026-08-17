@@ -555,7 +555,6 @@ function renderReview() {
       </td>
       <td>
         <div class="row-actions">
-          <button class="btn small" onclick="resolveItem(${item.id}, this)">Confirm</button>
           <button class="btn small secondary" onclick="ignoreItem(${item.id}, this)">Ignore</button>
         </div>
       </td>
@@ -569,33 +568,38 @@ function renderReview() {
   });
 }
 
-async function resolveItem(itemId, btn) {
-  const tr = btn.closest('tr');
+// itemId -> resolve body, built as rows render/change so confirmReceipt()
+// can resolve everything in one shot without a per-row button.
+async function resolveItem(itemId, tr) {
   const select = tr.querySelector('[data-role="match"]');
   const newName = tr.querySelector('[data-role="new-name"]').value;
   const body = select.value
     ? { action: 'match', product_id: Number(select.value) }
     : { action: 'new_product', name: newName };
-  try {
-    await api(`/api/receipts/${currentReceipt.id}/items/${itemId}/resolve`, { method: 'POST', body: JSON.stringify(body) });
-    btn.textContent = '✓ Confirmed';
-    btn.disabled = true;
-    tr.closest('tr').querySelectorAll('button').forEach((b) => b !== btn && (b.disabled = true));
-  } catch (err) { alert(err.message); }
+  await api(`/api/receipts/${currentReceipt.id}/items/${itemId}/resolve`, { method: 'POST', body: JSON.stringify(body) });
 }
 
 async function ignoreItem(itemId, btn) {
   await api(`/api/receipts/${currentReceipt.id}/items/${itemId}/resolve`, { method: 'POST', body: JSON.stringify({ action: 'ignore' }) });
-  btn.closest('tr').style.opacity = '0.4';
-  btn.closest('tr').querySelectorAll('button').forEach((b) => (b.disabled = true));
+  const tr = btn.closest('tr');
+  tr.dataset.ignored = 'true';
+  tr.style.opacity = '0.4';
+  tr.querySelectorAll('button').forEach((b) => (b.disabled = true));
 }
 
 async function confirmReceipt() {
   const status = document.getElementById('confirm-status');
-  status.textContent = 'Logging sales…';
+  const isPurchase = currentReceipt.receipt_type === 'purchase';
+  status.textContent = isPurchase ? 'Logging purchase…' : 'Logging sales…';
   try {
+    const rows = [...document.querySelectorAll('#review-rows tr')].filter((tr) => tr.dataset.ignored !== 'true');
+    for (const tr of rows) {
+      await resolveItem(Number(tr.dataset.itemId), tr);
+    }
     const res = await api(`/api/receipts/${currentReceipt.id}/confirm`, { method: 'POST' });
-    status.textContent = `Logged ${res.itemsLogged} item(s) — stock and demand forecasts updated.`;
+    status.textContent = isPurchase
+      ? `Logged ${res.itemsLogged} item(s) — stock increased.`
+      : `Logged ${res.itemsLogged} item(s) — stock and demand forecasts updated.`;
   } catch (err) { status.textContent = 'Error: ' + err.message; }
 }
 
