@@ -208,6 +208,7 @@
     <button class="tab-btn active" data-tab="scan">Scan Receipt</button>
     <button class="tab-btn" data-tab="inventory">Inventory</button>
     <button class="tab-btn" data-tab="recs">Recommendations</button>
+    <button class="tab-btn" data-tab="dashboard">Dashboard</button>
     <button class="tab-btn" data-tab="receipts">Receipts</button>
     <button class="tab-btn" data-tab="calendar">Calendar</button>
   </nav>
@@ -290,6 +291,27 @@
         <div id="ai-summary" style="display:none"></div>
         <div id="rec-list" style="margin-top:16px"></div>
         <div class="empty" id="rec-empty">Nothing computed yet — click "Generate AI note".</div>
+      </div>
+    </div>
+    <!-- DASHBOARD TAB -->
+    <div class="tab-content" id="tab-dashboard">
+      <div class="panel">
+        <div class="toolbar">
+          <h3 style="margin:0">Top sellers</h3>
+          <div style="margin-left:auto; display:flex; gap:6px" id="dash-period-buttons">
+            <button class="btn small secondary" data-period="day" onclick="setDashboardPeriod('day')">Day</button>
+            <button class="btn small secondary" data-period="week" onclick="setDashboardPeriod('week')">Week</button>
+            <button class="btn small secondary" data-period="month" onclick="setDashboardPeriod('month')">Month</button>
+            <button class="btn small secondary" data-period="year" onclick="setDashboardPeriod('year')">Year</button>
+          </div>
+        </div>
+        <div id="dash-products-list"></div>
+        <div class="empty" id="dash-products-empty" style="display:none">No sales in this period yet.</div>
+      </div>
+      <div class="panel">
+        <h3>Top categories</h3>
+        <div id="dash-categories-list"></div>
+        <div class="empty" id="dash-categories-empty" style="display:none">No sales in this period yet.</div>
       </div>
     </div>
     <!-- RECEIPTS TAB -->
@@ -427,8 +449,71 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
     if (btn.dataset.tab === 'inventory') loadProducts();
     if (btn.dataset.tab === 'calendar') loadCalendarTab();
     if (btn.dataset.tab === 'receipts') loadReceipts();
+    if (btn.dataset.tab === 'dashboard') loadDashboard();
   });
 });
+
+// ── Dashboard ─────────────────────────────────────────────────────────
+let currentDashboardPeriod = 'week';
+
+function setDashboardPeriod(period) {
+  currentDashboardPeriod = period;
+  loadDashboard();
+}
+
+async function loadDashboard() {
+  document.querySelectorAll('#dash-period-buttons button').forEach((b) => {
+    b.className = b.dataset.period === currentDashboardPeriod ? 'btn small' : 'btn small secondary';
+  });
+
+  const prodList = document.getElementById('dash-products-list');
+  const prodEmpty = document.getElementById('dash-products-empty');
+  const catList = document.getElementById('dash-categories-list');
+  const catEmpty = document.getElementById('dash-categories-empty');
+  prodList.innerHTML = '';
+  catList.innerHTML = '';
+
+  try {
+    const data = await api('/api/dashboard?period=' + currentDashboardPeriod);
+
+    if (!data.topProducts.length) {
+      prodEmpty.textContent = 'No sales in this period yet.';
+      prodEmpty.style.display = 'block';
+    } else {
+      prodEmpty.style.display = 'none';
+      data.topProducts.forEach((p, i) => {
+        const div = document.createElement('div');
+        div.className = 'rec-item';
+        div.innerHTML = `
+          <div>
+            <div class="name">#${i + 1} ${p.name}</div>
+            <div class="meta">${p.category} · ${p.sale_count} sale(s)</div>
+          </div>
+          <div class="rec-qty">${p.qty_sold} sold</div>
+        `;
+        prodList.appendChild(div);
+      });
+    }
+
+    if (!data.topCategories.length) {
+      catEmpty.style.display = 'block';
+    } else {
+      catEmpty.style.display = 'none';
+      data.topCategories.forEach((c) => {
+        const div = document.createElement('div');
+        div.className = 'rec-item';
+        div.innerHTML = `
+          <div><div class="name">${c.category}</div></div>
+          <div class="rec-qty">${c.qty_sold} sold</div>
+        `;
+        catList.appendChild(div);
+      });
+    }
+  } catch (err) {
+    prodEmpty.textContent = 'Error loading dashboard: ' + err.message;
+    prodEmpty.style.display = 'block';
+  }
+}
 
 // ── Receipts ──────────────────────────────────────────────────────────
 async function loadReceipts() {
