@@ -217,10 +217,11 @@ async function findBestMatch(env: Env, companyId: number, rawText: string): Prom
     const score = diceSimilarity(normalized, p.normalized_name);
     if (score > bestScore) { bestScore = score; best = p; }
   }
-  // 0.45 is a deliberately conservative threshold — false "new product"
-  // creation is cheap to fix in review, a false match silently corrupts
-  // that product's demand history.
-  if (bestScore < 0.45) return { product: null, confidence: bestScore };
+  // 0.65 threshold — false "new product" creation is cheap to fix in
+  // review, a false match silently corrupts that product's demand history.
+  // Raised from 0.45 after "CAT6 CABLE 50FT" false-matched "HDMI CABLE 6FT"
+  // at 55% (shared "CABLE" + digit/unit fragments inflate bigram overlap).
+  if (bestScore < 0.65) return { product: null, confidence: bestScore };
   return { product: best, confidence: bestScore };
 }
 
