@@ -591,12 +591,13 @@ export default {
 
       // POST /api/scan-receipt — vision model reads the photo, we fuzzy-match each line
       if (path === '/api/scan-receipt' && req.method === 'POST') {
-        const { imageBase64, mediaType } = await req.json() as { imageBase64: string; mediaType: string };
+        const body = await req.json() as { imageBase64: string; mediaType: string; receiptType?: 'sale' | 'purchase' };
+        const { imageBase64, mediaType } = body;
         const parsed = await callGemmaVision(env, imageBase64, mediaType);
 
         const receipt = await env.DB.prepare(
-          'INSERT INTO receipts (company_id, vendor, receipt_date) VALUES (?, ?, ?) RETURNING *'
-        ).bind(companyId, parsed.vendor ?? null, parsed.receiptDate ?? null).first();
+          'INSERT INTO receipts (company_id, vendor, receipt_date, receipt_type) VALUES (?, ?, ?, ?) RETURNING *'
+        ).bind(companyId, parsed.vendor ?? null, parsed.receiptDate ?? null, body.receiptType === 'purchase' ? 'purchase' : 'sale').first();
 
         const itemsOut = [];
         for (const item of parsed.items ?? []) {
@@ -682,17 +683,24 @@ export default {
           `SELECT * FROM receipt_items WHERE receipt_id = ? AND company_id = ? AND status = 'matched'`
         ).bind(receiptId, companyId).all<any>();
 
+        const isPurchase = receipt.receipt_type === 'purchase';
         for (const item of items ?? []) {
           const product = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(item.resolved_product_id, companyId).first<ProductRow>();
           if (!product) continue;
-          const model = updateDemandModel(product, item.qty, saleDate);
-          const newStock = Math.max(0, product.current_stock - item.qty);
-          await env.DB.prepare(
-            `UPDATE products SET current_stock = ?, demand_level = ?, demand_trend = ?, demand_variance = ?, last_sale_date = ? WHERE id = ?`
-          ).bind(newStock, model.demand_level, model.demand_trend, model.demand_variance, saleDate, product.id).run();
-          await env.DB.prepare(
-            'INSERT INTO sales_log (company_id, product_id, qty, sale_date, receipt_item_id) VALUES (?, ?, ?, ?, ?)'
-          ).bind(companyId, product.id, item.qty, saleDate, item.id).run();
+
+          if (isPurchase) {
+            const newStock = product.current_stock + item.qty;
+            await env.DB.prepare('UPDATE products SET current_stock = ? WHERE id = ?').bind(newStock, product.id).run();
+          } else {
+            const model = updateDemandModel(product, item.qty, saleDate);
+            const newStock = Math.max(0, product.current_stock - item.qty);
+            await env.DB.prepare(
+              `UPDATE products SET current_stock = ?, demand_level = ?, demand_trend = ?, demand_variance = ?, last_sale_date = ? WHERE id = ?`
+            ).bind(newStock, model.demand_level, model.demand_trend, model.demand_variance, saleDate, product.id).run();
+            await env.DB.prepare(
+              'INSERT INTO sales_log (company_id, product_id, qty, sale_date, receipt_item_id) VALUES (?, ?, ?, ?, ?)'
+            ).bind(companyId, product.id, item.qty, saleDate, item.id).run();
+          }
         }
 
         await env.DB.prepare('UPDATE receipts SET status = ? WHERE id = ?').bind('confirmed', receiptId).run();
