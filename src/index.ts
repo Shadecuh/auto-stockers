@@ -1,5 +1,6 @@
 // ─────────────────────────────────────────────────────────────────────────
-// AUTO STOCKERS — AI-powered restocking assistant
+// AUTO STOCKERS — AI-powered restocking assistant (multi-tenant)
+//
 // Theme: "AI as a tool" — receipt scanning + no-POS-integration demand
 // forecasting. Two things make this different from a generic reorder-point
 // calculator:
@@ -25,11 +26,18 @@
 // math into a short, readable purchase-order note (communication). The
 // actual forecasting math is deterministic and auditable — the "learning"
 // signal is per-item exponential smoothing, not a black box.
+//
+// MULTI-TENANCY. Any business can sign up, get its own company_id, and use
+// the app without ever seeing another company's data. That isolation is
+// enforced in exactly one place: getSession() below resolves a request's
+// auth token to a company_id, and every single query in this file binds
+// that company_id into its WHERE clause. There's no per-tenant database —
+// one shared D1 database, with company_id as the wall between tenants.
 // ─────────────────────────────────────────────────────────────────────────
 
 export interface Env {
   DB: D1Database;
-  ADMIN_PASSWORD: string;
+  SESSION_SECRET: string;      // HMAC key for signing session tokens — set with `wrangler secret put SESSION_SECRET`
   GEMINI_API_KEY: string;
   GOOGLE_CLIENT_ID: string;
   GOOGLE_CLIENT_SECRET: string;
@@ -49,12 +57,113 @@ function json(data: unknown, status = 200) {
   });
 }
 
-function authFail() {
-  return json({ error: 'Unauthorized' }, 401);
+function authFail(message = 'Unauthorized') {
+  return json({ error: message }, 401);
 }
 
-function checkAuth(req: Request, env: Env) {
-  return true; // password requirement removed
+// ─── Password hashing (PBKDF2-SHA256, Web Crypto — no external deps) ──────
+// Workers has SubtleCrypto but not bcrypt/scrypt, so PBKDF2 is the
+// standard choice here. 100k iterations is the OWASP-recommended floor for
+// PBKDF2-SHA256; lower it if you're on a CPU-time-limited plan and see
+// timeouts on signup/login.
+
+const PBKDF2_ITERATIONS = 100_000;
+
+function bytesToHex(buf: ArrayBuffer): string {
+  return [...new Uint8Array(buf)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+function hexToBytes(hex: string): Uint8Array {
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+  return out;
+}
+
+async function hashPassword(password: string, saltHex: string): Promise<string> {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: hexToBytes(saltHex), iterations: PBKDF2_ITERATIONS, hash: 'SHA-256' },
+    keyMaterial,
+    256
+  );
+  return bytesToHex(bits);
+}
+
+function generateSalt(): string {
+  return bytesToHex(crypto.getRandomValues(new Uint8Array(16)).buffer);
+}
+
+function timingSafeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return diff === 0;
+}
+
+// ─── Session tokens (HMAC-signed, stateless — no sessions table needed) ───
+// A minimal JWT-shaped token: base64url(payload) + "." + base64url(HMAC
+// signature). Payload carries exactly what every request needs to enforce
+// isolation: uid (user id) and cid (company id).
+
+type SessionPayload = { uid: number; cid: number; email: string; exp: number };
+
+function b64urlEncode(bytes: Uint8Array): string {
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function b64urlDecode(str: string): Uint8Array {
+  const pad = str.length % 4 === 0 ? '' : '='.repeat(4 - (str.length % 4));
+  const bin = atob(str.replace(/-/g, '+').replace(/_/g, '/') + pad);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+async function hmacKey(env: Env): Promise<CryptoKey> {
+  const enc = new TextEncoder();
+  return crypto.subtle.importKey('raw', enc.encode(env.SESSION_SECRET), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign', 'verify']);
+}
+
+async function signSession(env: Env, payload: SessionPayload): Promise<string> {
+  const enc = new TextEncoder();
+  const body = b64urlEncode(enc.encode(JSON.stringify(payload)));
+  const sig = await crypto.subtle.sign('HMAC', await hmacKey(env), enc.encode(body));
+  return `${body}.${b64urlEncode(new Uint8Array(sig))}`;
+}
+
+async function verifySession(env: Env, token: string): Promise<SessionPayload | null> {
+  const parts = token.split('.');
+  if (parts.length !== 2) return null;
+  const [body, sig] = parts;
+  const enc = new TextEncoder();
+  const valid = await crypto.subtle.verify('HMAC', await hmacKey(env), b64urlDecode(sig), enc.encode(body));
+  if (!valid) return null;
+  try {
+    const payload = JSON.parse(new TextDecoder().decode(b64urlDecode(body))) as SessionPayload;
+    if (typeof payload.exp !== 'number' || Date.now() > payload.exp) return null;
+    return payload;
+  } catch {
+    return null;
+  }
+}
+
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
+
+// Resolves a request to { userId, companyId }, or null if unauthenticated.
+// This is the ONLY place a request's tenant identity is determined — every
+// handler below gets its company_id from here, never from a request body
+// or query param (a client could lie about those; it can't forge a valid
+// signature without SESSION_SECRET).
+async function getSession(req: Request, env: Env): Promise<{ userId: number; companyId: number; email: string } | null> {
+  const header = req.headers.get('Authorization') || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return null;
+  const payload = await verifySession(env, token);
+  if (!payload) return null;
+  return { userId: payload.uid, companyId: payload.cid, email: payload.email };
 }
 
 // ─── Text normalization + fuzzy matching ───────────────────────────────────
@@ -89,17 +198,19 @@ function diceSimilarity(a: string, b: string): number {
 }
 
 type ProductRow = {
-  id: number; name: string; normalized_name: string; category: string;
+  id: number; company_id: number; name: string; normalized_name: string; category: string;
   unit_price: number; current_stock: number; lead_time_days: number;
   safety_z: number; demand_level: number; demand_trend: number;
   demand_variance: number; last_sale_date: string | null;
 };
 
-async function findBestMatch(env: Env, rawText: string): Promise<{ product: ProductRow | null; confidence: number }> {
+// Every lookup is scoped to companyId — a receipt line item can only ever
+// match a product that belongs to the same company that uploaded it.
+async function findBestMatch(env: Env, companyId: number, rawText: string): Promise<{ product: ProductRow | null; confidence: number }> {
   const normalized = normalizeText(rawText);
   const { results } = await env.DB.prepare(
-    'SELECT * FROM products WHERE archived = 0'
-  ).all<ProductRow>();
+    'SELECT * FROM products WHERE company_id = ? AND archived = 0'
+  ).bind(companyId).all<ProductRow>();
   let best: ProductRow | null = null;
   let bestScore = 0;
   for (const p of results ?? []) {
@@ -241,29 +352,39 @@ async function callGemmaText(env: Env, prompt: string): Promise<string> {
   return parts.find((p) => !p.thought && p.text)?.text?.trim() ?? '';
 }
 
-// ─── Google Calendar integration ───────────────────────────────────────────
+// ─── Google Calendar integration (per-company) ─────────────────────────────
 // Purpose: a demand spike isn't only visible in past sales — a known upcoming
 // event (a game night, a local festival, a holiday) predicts one before it
-// happens. We read the owner's real Google Calendar, then use Gemma to judge
-// which product categories a given event title is actually likely to affect
-// (a "Staff meeting" shouldn't boost anything; "Super Bowl watch party"
-// should boost beverages/snacks) — this is a genuinely different signal than
-// anything derivable from sales history alone.
+// happens. We read the connected company's real Google Calendar, then use
+// Gemma to judge which product categories a given event title is actually
+// likely to affect (a "Staff meeting" shouldn't boost anything; "Super Bowl
+// watch party" should boost beverages/snacks) — this is a genuinely
+// different signal than anything derivable from sales history alone.
+//
+// Every function here takes companyId and reads/writes settings scoped to
+// that company, so two companies connecting Google Calendar never touch
+// each other's tokens or events.
 
 const GOOGLE_SCOPES = 'https://www.googleapis.com/auth/calendar.readonly';
 
-async function getSetting(env: Env, key: string): Promise<string | null> {
-  const row = await env.DB.prepare('SELECT value FROM settings WHERE key = ?').bind(key).first<{ value: string }>();
+async function getSetting(env: Env, companyId: number, key: string): Promise<string | null> {
+  const row = await env.DB.prepare('SELECT value FROM settings WHERE company_id = ? AND key = ?').bind(companyId, key).first<{ value: string }>();
   return row?.value ?? null;
 }
 
-async function setSetting(env: Env, key: string, value: string) {
+async function setSetting(env: Env, companyId: number, key: string, value: string) {
   await env.DB.prepare(
-    'INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value'
-  ).bind(key, value).run();
+    'INSERT INTO settings (company_id, key, value) VALUES (?, ?, ?) ON CONFLICT(company_id, key) DO UPDATE SET value = excluded.value'
+  ).bind(companyId, key, value).run();
 }
 
-function buildGoogleAuthUrl(env: Env, state: string): string {
+// state carries the company_id through the Google redirect round-trip:
+// Google's callback hits our server directly (no Authorization header from
+// our frontend), so this is how the callback knows which tenant to save
+// tokens for. Signed the same way session tokens are, so it can't be
+// tampered with to attach tokens to a different company.
+async function buildGoogleAuthUrl(env: Env, companyId: number): Promise<string> {
+  const state = await signSession(env, { uid: 0, cid: companyId, email: '', exp: Date.now() + 10 * 60 * 1000 });
   const params = new URLSearchParams({
     client_id: env.GOOGLE_CLIENT_ID,
     redirect_uri: env.GOOGLE_REDIRECT_URI,
@@ -292,12 +413,12 @@ async function exchangeGoogleCode(env: Env, code: string) {
   return res.json() as Promise<{ access_token: string; refresh_token?: string; expires_in: number }>;
 }
 
-async function getValidGoogleAccessToken(env: Env): Promise<string | null> {
-  const refreshToken = await getSetting(env, 'google_refresh_token');
+async function getValidGoogleAccessToken(env: Env, companyId: number): Promise<string | null> {
+  const refreshToken = await getSetting(env, companyId, 'google_refresh_token');
   if (!refreshToken) return null;
 
-  const expiresAt = Number(await getSetting(env, 'google_token_expires_at') ?? '0');
-  const cached = await getSetting(env, 'google_access_token');
+  const expiresAt = Number(await getSetting(env, companyId, 'google_token_expires_at') ?? '0');
+  const cached = await getSetting(env, companyId, 'google_access_token');
   if (cached && Date.now() < expiresAt - 60_000) return cached;
 
   const res = await fetch('https://oauth2.googleapis.com/token', {
@@ -312,18 +433,18 @@ async function getValidGoogleAccessToken(env: Env): Promise<string | null> {
   });
   if (!res.ok) return null; // refresh token revoked/expired — treat as disconnected
   const data = await res.json() as { access_token: string; expires_in: number };
-  await setSetting(env, 'google_access_token', data.access_token);
-  await setSetting(env, 'google_token_expires_at', String(Date.now() + data.expires_in * 1000));
+  await setSetting(env, companyId, 'google_access_token', data.access_token);
+  await setSetting(env, companyId, 'google_token_expires_at', String(Date.now() + data.expires_in * 1000));
   return data.access_token;
 }
 
 type CalendarEvent = { title: string; start: string; end: string };
 
-// Pulls events in the next `daysAhead` days from the primary calendar.
-// Bounded window matches typical reorder lead times — events further out
-// aren't actionable for a restock decision yet.
-async function fetchUpcomingEvents(env: Env, daysAhead = 21): Promise<CalendarEvent[]> {
-  const token = await getValidGoogleAccessToken(env);
+// Pulls events in the next `daysAhead` days from the connected company's
+// primary calendar. Bounded window matches typical reorder lead times —
+// events further out aren't actionable for a restock decision yet.
+async function fetchUpcomingEvents(env: Env, companyId: number, daysAhead = 21): Promise<CalendarEvent[]> {
+  const token = await getValidGoogleAccessToken(env, companyId);
   if (!token) return [];
 
   const timeMin = new Date().toISOString();
@@ -387,24 +508,104 @@ export default {
     if (req.method === 'OPTIONS') return new Response(null, { headers: CORS });
 
     try {
+      // ── Auth ──────────────────────────────────────────────────────────
+
+      // POST /api/auth/signup — creates a new company + its first (owner) user
+      if (path === '/api/auth/signup' && req.method === 'POST') {
+        const b = await req.json() as { company_name: string; business_type?: string; email: string; password: string };
+        const companyName = (b.company_name || '').trim();
+        const email = (b.email || '').trim().toLowerCase();
+        const password = b.password || '';
+        if (!companyName) return json({ error: 'Company name is required' }, 400);
+        if (!email || !email.includes('@')) return json({ error: 'A valid email is required' }, 400);
+        if (password.length < 8) return json({ error: 'Password must be at least 8 characters' }, 400);
+
+        const existing = await env.DB.prepare('SELECT id FROM users WHERE email = ?').bind(email).first();
+        if (existing) return json({ error: 'An account with that email already exists' }, 409);
+
+        const company = await env.DB.prepare(
+          'INSERT INTO companies (name, business_type) VALUES (?, ?) RETURNING *'
+        ).bind(companyName, b.business_type || 'General').first<any>();
+
+        const salt = generateSalt();
+        const hash = await hashPassword(password, salt);
+        const user = await env.DB.prepare(
+          'INSERT INTO users (company_id, email, password_hash, password_salt) VALUES (?, ?, ?, ?) RETURNING *'
+        ).bind(company.id, email, hash, salt).first<any>();
+
+        const token = await signSession(env, { uid: user.id, cid: company.id, email, exp: Date.now() + SESSION_TTL_MS });
+        return json({ token, company: { id: company.id, name: company.name, business_type: company.business_type } }, 201);
+      }
+
+      // POST /api/auth/login
+      if (path === '/api/auth/login' && req.method === 'POST') {
+        const b = await req.json() as { email: string; password: string };
+        const email = (b.email || '').trim().toLowerCase();
+        const user = await env.DB.prepare('SELECT * FROM users WHERE email = ?').bind(email).first<any>();
+        if (!user) return authFail('Incorrect email or password');
+
+        const hash = await hashPassword(b.password || '', user.password_salt);
+        if (!timingSafeEqual(hash, user.password_hash)) return authFail('Incorrect email or password');
+
+        const company = await env.DB.prepare('SELECT * FROM companies WHERE id = ?').bind(user.company_id).first<any>();
+        const token = await signSession(env, { uid: user.id, cid: user.company_id, email, exp: Date.now() + SESSION_TTL_MS });
+        return json({ token, company: { id: company.id, name: company.name, business_type: company.business_type } });
+      }
+
+      // GET /api/auth/me — used on page load to validate a stored token and
+      // repopulate the header without asking the owner to log in again
+      if (path === '/api/auth/me' && req.method === 'GET') {
+        const session = await getSession(req, env);
+        if (!session) return authFail();
+        const company = await env.DB.prepare('SELECT * FROM companies WHERE id = ?').bind(session.companyId).first<any>();
+        if (!company) return authFail();
+        return json({ company: { id: company.id, name: company.name, business_type: company.business_type }, email: session.email });
+      }
+
+      // ── Everything below requires a valid session ───────────────────────
+      const session = await getSession(req, env);
+
+      // GET /api/calendar/callback is the one exception: Google redirects the
+      // owner's browser here directly, with no Authorization header. The
+      // company identity instead comes from the signed `state` param.
+      if (path === '/api/calendar/callback' && req.method === 'GET') {
+        const code = url.searchParams.get('code');
+        const state = url.searchParams.get('state');
+        if (!code || !state) return json({ error: 'missing code or state' }, 400);
+        const statePayload = await verifySession(env, state);
+        if (!statePayload) return json({ error: 'invalid or expired state' }, 400);
+        const companyId = statePayload.cid;
+
+        const tokens = await exchangeGoogleCode(env, code);
+        if (tokens.refresh_token) await setSetting(env, companyId, 'google_refresh_token', tokens.refresh_token);
+        await setSetting(env, companyId, 'google_access_token', tokens.access_token);
+        await setSetting(env, companyId, 'google_token_expires_at', String(Date.now() + tokens.expires_in * 1000));
+        return new Response(
+          '<html><body style="font-family:sans-serif;text-align:center;padding:40px">Google Calendar connected — you can close this tab.</body></html>',
+          { headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+
+      if (!session) return authFail();
+      const companyId = session.companyId;
+
       // POST /api/scan-receipt — vision model reads the photo, we fuzzy-match each line
       if (path === '/api/scan-receipt' && req.method === 'POST') {
-        if (!checkAuth(req, env)) return authFail();
         const { imageBase64, mediaType } = await req.json() as { imageBase64: string; mediaType: string };
         const parsed = await callGemmaVision(env, imageBase64, mediaType);
 
         const receipt = await env.DB.prepare(
-          'INSERT INTO receipts (vendor, receipt_date) VALUES (?, ?) RETURNING *'
-        ).bind(parsed.vendor ?? null, parsed.receiptDate ?? null).first();
+          'INSERT INTO receipts (company_id, vendor, receipt_date) VALUES (?, ?, ?) RETURNING *'
+        ).bind(companyId, parsed.vendor ?? null, parsed.receiptDate ?? null).first();
 
         const itemsOut = [];
         for (const item of parsed.items ?? []) {
-          const { product, confidence } = await findBestMatch(env, item.rawText);
+          const { product, confidence } = await findBestMatch(env, companyId, item.rawText);
           const row = await env.DB.prepare(
-            `INSERT INTO receipt_items (receipt_id, raw_text, qty, unit_price, suggested_product_id, match_confidence, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
+            `INSERT INTO receipt_items (company_id, receipt_id, raw_text, qty, unit_price, suggested_product_id, match_confidence, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
           ).bind(
-            (receipt as any).id, item.rawText, item.qty || 1, item.unitPrice || 0,
+            companyId, (receipt as any).id, item.rawText, item.qty || 1, item.unitPrice || 0,
             product?.id ?? null, confidence, product ? 'unconfirmed' : 'unconfirmed'
           ).first();
           itemsOut.push({ ...row, suggested_product_name: product?.name ?? null });
@@ -416,22 +617,26 @@ export default {
       // GET /api/receipts/:id — review a scanned receipt
       const receiptGet = path.match(/^\/api\/receipts\/(\d+)$/);
       if (receiptGet && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
         const id = Number(receiptGet[1]);
-        const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ?').bind(id).first();
+        const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ? AND company_id = ?').bind(id, companyId).first();
+        if (!receipt) return json({ error: 'not found' }, 404);
         const { results: items } = await env.DB.prepare(
           `SELECT ri.*, p.name AS suggested_product_name
            FROM receipt_items ri LEFT JOIN products p ON p.id = ri.suggested_product_id
-           WHERE ri.receipt_id = ?`
-        ).bind(id).all();
+           WHERE ri.receipt_id = ? AND ri.company_id = ?`
+        ).bind(id, companyId).all();
         return json({ receipt, items });
       }
 
       // POST /api/receipts/:id/items/:itemId/resolve — human confirms/creates/ignores a line
       const resolveMatch = path.match(/^\/api\/receipts\/(\d+)\/items\/(\d+)\/resolve$/);
       if (resolveMatch && req.method === 'POST') {
-        if (!checkAuth(req, env)) return authFail();
+        const receiptId = Number(resolveMatch[1]);
         const itemId = Number(resolveMatch[2]);
+        const item = await env.DB.prepare('SELECT id FROM receipt_items WHERE id = ? AND receipt_id = ? AND company_id = ?')
+          .bind(itemId, receiptId, companyId).first();
+        if (!item) return json({ error: 'not found' }, 404);
+
         const body = await req.json() as {
           action: 'match' | 'new_product' | 'ignore';
           product_id?: number;
@@ -448,10 +653,14 @@ export default {
           const name = (body.name || '').trim();
           if (!name) return json({ error: 'name required for new_product' }, 400);
           const created = await env.DB.prepare(
-            `INSERT INTO products (name, normalized_name, category, unit_price, current_stock, lead_time_days)
-             VALUES (?, ?, ?, ?, 0, ?) RETURNING *`
-          ).bind(name, normalizeText(name), body.category || 'General', body.unit_price || 0, body.lead_time_days || 3).first();
+            `INSERT INTO products (company_id, name, normalized_name, category, unit_price, current_stock, lead_time_days)
+             VALUES (?, ?, ?, ?, ?, 0, ?) RETURNING *`
+          ).bind(companyId, name, normalizeText(name), body.category || 'General', body.unit_price || 0, body.lead_time_days || 3).first();
           productId = (created as any).id;
+        } else if (productId) {
+          // matching to an existing product — make sure it's actually this company's product
+          const owned = await env.DB.prepare('SELECT id FROM products WHERE id = ? AND company_id = ?').bind(productId, companyId).first();
+          if (!owned) return json({ error: 'product not found' }, 404);
         }
 
         if (!productId) return json({ error: 'product_id required for match' }, 400);
@@ -464,18 +673,17 @@ export default {
       // POST /api/receipts/:id/confirm — log sales, decrement stock, update demand model
       const confirmMatch = path.match(/^\/api\/receipts\/(\d+)\/confirm$/);
       if (confirmMatch && req.method === 'POST') {
-        if (!checkAuth(req, env)) return authFail();
         const receiptId = Number(confirmMatch[1]);
-        const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ?').bind(receiptId).first<any>();
+        const receipt = await env.DB.prepare('SELECT * FROM receipts WHERE id = ? AND company_id = ?').bind(receiptId, companyId).first<any>();
         if (!receipt) return json({ error: 'Receipt not found' }, 404);
 
         const saleDate = receipt.receipt_date || new Date().toISOString().slice(0, 10);
         const { results: items } = await env.DB.prepare(
-          `SELECT * FROM receipt_items WHERE receipt_id = ? AND status = 'matched'`
-        ).bind(receiptId).all<any>();
+          `SELECT * FROM receipt_items WHERE receipt_id = ? AND company_id = ? AND status = 'matched'`
+        ).bind(receiptId, companyId).all<any>();
 
         for (const item of items ?? []) {
-          const product = await env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(item.resolved_product_id).first<ProductRow>();
+          const product = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(item.resolved_product_id, companyId).first<ProductRow>();
           if (!product) continue;
           const model = updateDemandModel(product, item.qty, saleDate);
           const newStock = Math.max(0, product.current_stock - item.qty);
@@ -483,8 +691,8 @@ export default {
             `UPDATE products SET current_stock = ?, demand_level = ?, demand_trend = ?, demand_variance = ?, last_sale_date = ? WHERE id = ?`
           ).bind(newStock, model.demand_level, model.demand_trend, model.demand_variance, saleDate, product.id).run();
           await env.DB.prepare(
-            'INSERT INTO sales_log (product_id, qty, sale_date, receipt_item_id) VALUES (?, ?, ?, ?)'
-          ).bind(product.id, item.qty, saleDate, item.id).run();
+            'INSERT INTO sales_log (company_id, product_id, qty, sale_date, receipt_item_id) VALUES (?, ?, ?, ?, ?)'
+          ).bind(companyId, product.id, item.qty, saleDate, item.id).run();
         }
 
         await env.DB.prepare('UPDATE receipts SET status = ? WHERE id = ?').bind('confirmed', receiptId).run();
@@ -492,88 +700,67 @@ export default {
       }
 
       // GET /api/calendar/auth-url — kicks off the Google OAuth consent flow
+      // for THIS company (company_id is embedded in the signed state param)
       if (path === '/api/calendar/auth-url' && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
-        const url = buildGoogleAuthUrl(env, crypto.randomUUID());
-        return json({ url });
-      }
-
-      // GET /api/calendar/callback — Google redirects here with ?code=...
-      // (no checkAuth: Google hits this directly, not the frontend fetch())
-      if (path === '/api/calendar/callback' && req.method === 'GET') {
-        const code = url.searchParams.get('code');
-        if (!code) return json({ error: 'missing code' }, 400);
-        const tokens = await exchangeGoogleCode(env, code);
-        if (tokens.refresh_token) await setSetting(env, 'google_refresh_token', tokens.refresh_token);
-        await setSetting(env, 'google_access_token', tokens.access_token);
-        await setSetting(env, 'google_token_expires_at', String(Date.now() + tokens.expires_in * 1000));
-        return new Response(
-          '<html><body style="font-family:sans-serif;text-align:center;padding:40px">Google Calendar connected — you can close this tab.</body></html>',
-          { headers: { 'Content-Type': 'text/html' } }
-        );
+        const authUrl = await buildGoogleAuthUrl(env, companyId);
+        return json({ url: authUrl });
       }
 
       // GET /api/calendar/status
       if (path === '/api/calendar/status' && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
-        const connected = !!(await getSetting(env, 'google_refresh_token'));
+        const connected = !!(await getSetting(env, companyId, 'google_refresh_token'));
         return json({ connected });
       }
 
       // POST /api/calendar/disconnect
       if (path === '/api/calendar/disconnect' && req.method === 'POST') {
-        if (!checkAuth(req, env)) return authFail();
-        await env.DB.prepare('DELETE FROM settings WHERE key IN (?, ?, ?)')
-          .bind('google_refresh_token', 'google_access_token', 'google_token_expires_at').run();
+        await env.DB.prepare('DELETE FROM settings WHERE company_id = ? AND key IN (?, ?, ?)')
+          .bind(companyId, 'google_refresh_token', 'google_access_token', 'google_token_expires_at').run();
         return json({ ok: true });
       }
 
       // GET /api/calendar/upcoming-events — raw events, for display in the UI
       if (path === '/api/calendar/upcoming-events' && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
-        const events = await fetchUpcomingEvents(env);
+        const events = await fetchUpcomingEvents(env, companyId);
         return json(events);
       }
 
       // GET /api/products
       if (path === '/api/products' && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
         const { results } = await env.DB.prepare(
-          'SELECT * FROM products WHERE archived = 0 ORDER BY name'
-        ).all<ProductRow>();
+          'SELECT * FROM products WHERE company_id = ? AND archived = 0 ORDER BY name'
+        ).bind(companyId).all<ProductRow>();
         const withRecs = (results ?? []).map((p) => ({ ...p, ...computeRecommendation(p) }));
         return json(withRecs);
       }
 
       // POST /api/products — manual add
       if (path === '/api/products' && req.method === 'POST') {
-        if (!checkAuth(req, env)) return authFail();
         const b = await req.json() as { name: string; category?: string; unit_price?: number; current_stock?: number; lead_time_days?: number };
         if (!b.name?.trim()) return json({ error: 'name required' }, 400);
         const row = await env.DB.prepare(
-          `INSERT INTO products (name, normalized_name, category, unit_price, current_stock, lead_time_days)
-           VALUES (?, ?, ?, ?, ?, ?) RETURNING *`
-        ).bind(b.name.trim(), normalizeText(b.name), b.category || 'General', b.unit_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
+          `INSERT INTO products (company_id, name, normalized_name, category, unit_price, current_stock, lead_time_days)
+           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
+        ).bind(companyId, b.name.trim(), normalizeText(b.name), b.category || 'General', b.unit_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
         return json(row, 201);
       }
 
       // PUT /api/products/:id — edit stock / lead time / price / archive
       const productMatch = path.match(/^\/api\/products\/(\d+)$/);
       if (productMatch && req.method === 'PUT') {
-        if (!checkAuth(req, env)) return authFail();
         const id = Number(productMatch[1]);
         const b = await req.json() as Partial<{ name: string; category: string; unit_price: number; current_stock: number; lead_time_days: number; archived: boolean }>;
-        const existing = await env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(id).first<ProductRow>();
+        const existing = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first<ProductRow>();
         if (!existing) return json({ error: 'not found' }, 404);
         const name = b.name ?? existing.name;
         await env.DB.prepare(
-          `UPDATE products SET name=?, normalized_name=?, category=?, unit_price=?, current_stock=?, lead_time_days=?, archived=? WHERE id=?`
+          `UPDATE products SET name=?, normalized_name=?, category=?, unit_price=?, current_stock=?, lead_time_days=?, archived=? WHERE id=? AND company_id=?`
         ).bind(
           name, normalizeText(name), b.category ?? existing.category, b.unit_price ?? existing.unit_price,
           b.current_stock ?? existing.current_stock, b.lead_time_days ?? existing.lead_time_days,
-          b.archived ? 1 : 0, id
+          b.archived ? 1 : 0, id, companyId
         ).run();
-        const row = await env.DB.prepare('SELECT * FROM products WHERE id = ?').bind(id).first();
+        const row = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first();
         return json(row);
       }
 
@@ -582,31 +769,29 @@ export default {
       // sales_log / receipt_items rows don't dangle on a missing product.
       const deleteMatch = path.match(/^\/api\/products\/(\d+)$/);
       if (deleteMatch && req.method === 'DELETE') {
-        if (!checkAuth(req, env)) return authFail();
         const id = Number(deleteMatch[1]);
-        const existing = await env.DB.prepare('SELECT id FROM products WHERE id = ?').bind(id).first();
+        const existing = await env.DB.prepare('SELECT id FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first();
         if (!existing) return json({ error: 'not found' }, 404);
 
         const salesCount = await env.DB.prepare(
-          'SELECT COUNT(*) AS n FROM sales_log WHERE product_id = ?'
-        ).bind(id).first<{ n: number }>();
+          'SELECT COUNT(*) AS n FROM sales_log WHERE product_id = ? AND company_id = ?'
+        ).bind(id, companyId).first<{ n: number }>();
 
         if ((salesCount?.n ?? 0) === 0) {
-          await env.DB.prepare('DELETE FROM products WHERE id = ?').bind(id).run();
+          await env.DB.prepare('DELETE FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).run();
           return json({ deleted: true, archived: false });
         } else {
-          await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ?').bind(id).run();
+          await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ? AND company_id = ?').bind(id, companyId).run();
           return json({ deleted: false, archived: true });
         }
       }
 
       // GET /api/recommendations — compute fresh recs for items at/below reorder point
       if (path === '/api/recommendations' && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
-        const { results } = await env.DB.prepare('SELECT * FROM products WHERE archived = 0').all<ProductRow>();
+        const { results } = await env.DB.prepare('SELECT * FROM products WHERE company_id = ? AND archived = 0').bind(companyId).all<ProductRow>();
         const products = results ?? [];
         const categories = [...new Set(products.map((p) => p.category))];
-        const events = await fetchUpcomingEvents(env);
+        const events = await fetchUpcomingEvents(env, companyId);
         const boosts = await getEventDemandBoosts(env, categories, events);
         const recs = products
           .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
@@ -620,11 +805,10 @@ export default {
 
       // POST /api/recommendations/generate — AI drafts a readable restock note
       if (path === '/api/recommendations/generate' && req.method === 'POST') {
-        if (!checkAuth(req, env)) return authFail();
-        const { results } = await env.DB.prepare('SELECT * FROM products WHERE archived = 0').all<ProductRow>();
+        const { results } = await env.DB.prepare('SELECT * FROM products WHERE company_id = ? AND archived = 0').bind(companyId).all<ProductRow>();
         const products = results ?? [];
         const categories = [...new Set(products.map((p) => p.category))];
-        const events = await fetchUpcomingEvents(env);
+        const events = await fetchUpcomingEvents(env, companyId);
         const boosts = await getEventDemandBoosts(env, categories, events);
         const needing = products
           .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
@@ -648,10 +832,10 @@ export default {
 
         for (const r of needing) {
           await env.DB.prepare(
-            `INSERT INTO restock_recommendations (product_id, reorder_point, target_stock, recommended_qty, days_of_stock_left, reasoning, ai_summary)
-             VALUES (?, ?, ?, ?, ?, ?, ?)`
+            `INSERT INTO restock_recommendations (company_id, product_id, reorder_point, target_stock, recommended_qty, days_of_stock_left, reasoning, ai_summary)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`
           ).bind(
-            r.product.id, r.rec.reorderPoint, r.rec.targetStock, r.rec.recommendedQty,
+            companyId, r.product.id, r.rec.reorderPoint, r.rec.targetStock, r.rec.recommendedQty,
             r.rec.daysOfStockLeft === Infinity ? null : r.rec.daysOfStockLeft, r.rec.reasoning, summary
           ).run();
         }
@@ -668,11 +852,12 @@ export default {
       // GET /api/sales-history/:productId — for the trend sparkline
       const historyMatch = path.match(/^\/api\/sales-history\/(\d+)$/);
       if (historyMatch && req.method === 'GET') {
-        if (!checkAuth(req, env)) return authFail();
         const id = Number(historyMatch[1]);
+        const owned = await env.DB.prepare('SELECT id FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first();
+        if (!owned) return json({ error: 'not found' }, 404);
         const { results } = await env.DB.prepare(
-          'SELECT sale_date, qty FROM sales_log WHERE product_id = ? ORDER BY sale_date ASC'
-        ).bind(id).all();
+          'SELECT sale_date, qty FROM sales_log WHERE product_id = ? AND company_id = ? ORDER BY sale_date ASC'
+        ).bind(id, companyId).all();
         return json(results);
       }
 
