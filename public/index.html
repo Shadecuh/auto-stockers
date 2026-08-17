@@ -185,6 +185,16 @@
       <div class="panel">
         <h3>1. Upload a receipt photo</h3>
         <p class="muted">The vision model reads line items off the receipt, then we fuzzy-match each one against your existing inventory. Nothing touches stock until you confirm below. You can tap to choose a file, paste an image (Ctrl/Cmd+V), or drag a photo in from another window.</p>
+        <div style="display:flex; gap:8px; margin-bottom:12px;">
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="radio" name="receipt-type" value="sale" checked onchange="currentReceiptType = this.value">
+            Sale (customer bought this — subtract stock)
+          </label>
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input type="radio" name="receipt-type" value="purchase" onchange="currentReceiptType = this.value">
+            Purchase (you're restocking — add stock)
+          </label>
+        </div>
         <div id="dropzone" onclick="document.getElementById('file-input').click()"
              ondragover="handleDragOver(event)" ondragleave="handleDragLeave(event)" ondrop="handleDrop(event)">
           <div class="scanline"></div>
@@ -421,6 +431,8 @@ function fileToBase64(file) {
   });
 }
 
+let currentReceiptType = 'sale';
+
 // Single entry point for a receipt image, regardless of how it arrived
 // (file picker, drag-and-drop, or clipboard paste).
 async function processReceiptFile(file) {
@@ -438,7 +450,7 @@ async function processReceiptFile(file) {
     const base64 = await fileToBase64(file);
     const data = await api('/api/scan-receipt', {
       method: 'POST',
-      body: JSON.stringify({ imageBase64: base64, mediaType: file.type || 'image/jpeg' }),
+      body: JSON.stringify({ imageBase64: base64, mediaType: file.type || 'image/jpeg', receiptType: currentReceiptType }),
     });
     currentReceipt = data.receipt;
     currentItems = data.items;
