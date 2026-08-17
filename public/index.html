@@ -26,27 +26,33 @@
     min-height: 100vh;
   }
   h1, h2, h3, .display { font-family: 'Space Grotesk', sans-serif; }
-  /* ── Login gate ─────────────────────────────────────────── */
-  #login-screen {
+  /* ── Login / signup gate ────────────────────────────────── */
+  #auth-screen {
     min-height: 100vh; display: flex; align-items: center; justify-content: center;
-    flex-direction: column; gap: 16px; padding: 20px;
+    flex-direction: column; gap: 14px; padding: 20px;
   }
-  #login-screen .logo { font-size: 2rem; font-weight: 700; letter-spacing: -1px; }
-  #login-screen .logo span { color: var(--amber); }
-  #login-screen input {
-    background: var(--panel); border: 1px solid var(--border); color: var(--text);
-    padding: 12px 14px; border-radius: 8px; font-family: inherit; font-size: 1rem; width: 260px;
+  #auth-screen .logo { font-size: 2rem; font-weight: 700; letter-spacing: -1px; }
+  #auth-screen .logo span { color: var(--amber); }
+  #auth-card {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+    padding: 24px; width: 320px; display: flex; flex-direction: column; gap: 10px;
   }
-  #login-screen button, .btn {
+  #auth-card input, #auth-card select {
+    background: var(--panel-2); border: 1px solid var(--border); color: var(--text);
+    padding: 12px 14px; border-radius: 8px; font-family: inherit; font-size: 0.95rem; width: 100%;
+  }
+  #auth-screen button, .btn {
     background: var(--amber); color: #1a1200; border: none; padding: 12px 18px;
     border-radius: 8px; font-family: 'Space Grotesk', sans-serif; font-weight: 700;
     cursor: pointer; font-size: 0.95rem; transition: transform .1s, opacity .15s;
   }
-  #login-screen button:hover, .btn:hover { transform: translateY(-1px); }
+  #auth-screen button:hover, .btn:hover { transform: translateY(-1px); }
   .btn.secondary { background: transparent; color: var(--text); border: 1px solid var(--border); }
   .btn.small { padding: 6px 12px; font-size: 0.8rem; }
   .btn:disabled { opacity: 0.4; cursor: not-allowed; transform: none; }
-  #login-error { color: var(--red); font-size: 0.85rem; min-height: 1em; }
+  #auth-error { color: var(--red); font-size: 0.85rem; min-height: 1em; }
+  #auth-toggle { color: var(--text-dim); font-size: 0.85rem; cursor: pointer; text-align: center; }
+  #auth-toggle span { color: var(--amber); text-decoration: underline; }
 
   /* ── App shell ──────────────────────────────────────────── */
   #app { display: none; }
@@ -59,6 +65,7 @@
   header.top .logo { font-size: 1.3rem; font-weight: 700; }
   header.top .logo span { color: var(--amber); }
   header.top .logo small { color: var(--text-dim); font-weight: 400; font-size: 0.65rem; display: block; margin-top: 2px; letter-spacing: 1px; }
+  header.top .company-name { color: var(--text-dim); font-size: 0.8rem; }
 
   nav.tabs { display: flex; gap: 4px; padding: 12px 24px 0; border-bottom: 1px solid var(--border); }
   nav.tabs button {
@@ -131,17 +138,36 @@
 </head>
 <body>
 
-<div id="login-screen">
+<div id="auth-screen">
   <div class="logo">AUTO <span>STOCKERS</span></div>
-  <div class="muted">AI-powered restocking assistant</div>
-  <input type="password" id="login-password" placeholder="Admin password" />
-  <button onclick="login()">Enter</button>
-  <div id="login-error"></div>
+  <div class="muted">AI-powered restocking assistant — for any shop, restaurant, or store</div>
+
+  <div id="auth-card">
+    <!-- Signup-only fields -->
+    <input type="text" id="auth-company-name" placeholder="Business name" style="display:none">
+    <select id="auth-business-type" style="display:none">
+      <option value="General">General / Other</option>
+      <option value="Retail Store">Retail Store</option>
+      <option value="Restaurant">Restaurant</option>
+      <option value="Cafe">Cafe / Coffee Shop</option>
+      <option value="Auto Parts">Auto Parts</option>
+      <option value="Hardware">Hardware Store</option>
+      <option value="Grocery">Grocery / Convenience</option>
+    </select>
+    <!-- Shared fields -->
+    <input type="email" id="auth-email" placeholder="Email">
+    <input type="password" id="auth-password" placeholder="Password">
+    <button id="auth-submit" onclick="submitAuth()">Create account</button>
+    <div id="auth-error"></div>
+    <div id="auth-toggle" onclick="toggleAuthMode()">Already have an account? <span>Log in</span></div>
+  </div>
 </div>
 
 <div id="app">
   <header class="top">
-    <div class="logo">AUTO <span>STOCKERS</span><small>NO-POS RESTOCK ENGINE</small></div>
+    <div class="logo">AUTO <span>STOCKERS</span><small>NO-POS RESTOCK ENGINE</small>
+      <div class="company-name" id="header-company-name"></div>
+    </div>
     <button class="btn secondary small" onclick="logout()">Log out</button>
   </header>
 
@@ -221,7 +247,7 @@
     <div class="tab-content" id="tab-calendar">
       <div class="panel">
         <h3>Google Calendar</h3>
-        <p class="muted">Connecting your calendar lets recommendations account for upcoming events — a game night or festival can bump expected demand for relevant categories before it shows up in sales history.</p>
+        <p class="muted">Connecting your calendar lets recommendations account for upcoming events — a game night or festival can bump expected demand for relevant categories before it shows up in sales history. Only your business sees the events you connect.</p>
         <div id="cal-disconnected">
           <button class="btn" onclick="connectCalendar()">Connect Google Calendar</button>
         </div>
@@ -244,43 +270,92 @@
 <script>
 const API_BASE = ''; // same-origin: Worker serves this file and the /api/* routes
 
-let PASSWORD = localStorage.getItem('as_pw') || '';
+let TOKEN = localStorage.getItem('as_token') || '';
+let CURRENT_COMPANY = null;
+let authMode = 'signup'; // 'signup' | 'login'
 let currentReceipt = null;
 let currentItems = [];
 let allProducts = [];
 
 function authHeaders() {
-  return { 'Authorization': 'Bearer ' + PASSWORD, 'Content-Type': 'application/json' };
+  return { 'Authorization': 'Bearer ' + TOKEN, 'Content-Type': 'application/json' };
 }
 
 async function api(path, opts = {}) {
   const res = await fetch(API_BASE + path, { ...opts, headers: { ...authHeaders(), ...(opts.headers || {}) } });
-  if (res.status === 401) { logout(); throw new Error('Unauthorized'); }
+  if (res.status === 401) { logout(); throw new Error('Session expired — please log in again.'); }
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.error || 'Request failed'); }
   return res.json();
 }
 
-function login() {
-  const val = document.getElementById('login-password').value;
-  PASSWORD = val;
-  api('/api/products').then(() => {
-    localStorage.setItem('as_pw', val);
-    document.getElementById('login-screen').style.display = 'none';
-    document.getElementById('app').style.display = 'block';
-    loadProducts();
-  }).catch(() => {
-    document.getElementById('login-error').textContent = 'Incorrect password.';
-  });
+// ── Auth ─────────────────────────────────────────────────────────────
+function toggleAuthMode() {
+  authMode = authMode === 'signup' ? 'login' : 'signup';
+  const isSignup = authMode === 'signup';
+  document.getElementById('auth-company-name').style.display = isSignup ? 'block' : 'none';
+  document.getElementById('auth-business-type').style.display = isSignup ? 'block' : 'none';
+  document.getElementById('auth-submit').textContent = isSignup ? 'Create account' : 'Log in';
+  document.getElementById('auth-toggle').innerHTML = isSignup
+    ? 'Already have an account? <span>Log in</span>'
+    : 'New business? <span>Create an account</span>';
+  document.getElementById('auth-error').textContent = '';
+}
+
+async function submitAuth() {
+  const email = document.getElementById('auth-email').value.trim();
+  const password = document.getElementById('auth-password').value;
+  const errorEl = document.getElementById('auth-error');
+  errorEl.textContent = '';
+
+  try {
+    let data;
+    if (authMode === 'signup') {
+      const companyName = document.getElementById('auth-company-name').value.trim();
+      const businessType = document.getElementById('auth-business-type').value;
+      if (!companyName) { errorEl.textContent = 'Business name is required.'; return; }
+      data = await api('/api/auth/signup', {
+        method: 'POST',
+        body: JSON.stringify({ company_name: companyName, business_type: businessType, email, password }),
+      });
+    } else {
+      data = await api('/api/auth/login', { method: 'POST', body: JSON.stringify({ email, password }) });
+    }
+    TOKEN = data.token;
+    CURRENT_COMPANY = data.company;
+    localStorage.setItem('as_token', TOKEN);
+    enterApp();
+  } catch (err) {
+    errorEl.textContent = err.message;
+  }
 }
 
 function logout() {
-  localStorage.removeItem('as_pw');
+  localStorage.removeItem('as_token');
   location.reload();
 }
 
-document.getElementById('login-screen').style.display = 'none';
-document.getElementById('app').style.display = 'block';
-loadProducts();
+function enterApp() {
+  document.getElementById('auth-screen').style.display = 'none';
+  document.getElementById('app').style.display = 'block';
+  document.getElementById('header-company-name').textContent = CURRENT_COMPANY ? CURRENT_COMPANY.name : '';
+  loadProducts();
+}
+
+async function restoreSession() {
+  if (!TOKEN) return; // stay on the auth screen
+  try {
+    const data = await api('/api/auth/me');
+    CURRENT_COMPANY = data.company;
+    enterApp();
+  } catch {
+    // token invalid/expired — fall through to the auth screen
+  }
+}
+// authMode starts as 'signup', but the signup-only fields default to
+// display:none in the HTML — show them up front instead of only on toggle.
+document.getElementById('auth-company-name').style.display = 'block';
+document.getElementById('auth-business-type').style.display = 'block';
+restoreSession();
 
 // ── Tabs ──────────────────────────────────────────────────────────────
 document.querySelectorAll('.tab-btn').forEach((btn) => {
