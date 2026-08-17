@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Auto Stockers</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
 <style>
@@ -258,8 +259,12 @@
       <div class="panel">
         <div class="toolbar">
           <h3 style="margin:0">Products</h3>
-          <button class="btn small" style="margin-left:auto" onclick="showAddProduct()">+ Add product</button>
+          <div style="margin-left:auto; display:flex; gap:8px">
+            <button class="btn small secondary" onclick="recategorizeProducts()">Auto-categorize</button>
+            <button class="btn small" onclick="showAddProduct()">+ Add product</button>
+          </div>
         </div>
+        <div id="recategorize-status" class="muted" style="margin-top:8px; display:none"></div>
         <div id="add-product-form" style="display:none; margin-bottom:16px; padding:14px; background:var(--panel-2); border-radius:8px;">
           <div class="add-product-grid" style="display:grid; grid-template-columns:2fr 1fr 1fr 1fr auto; gap:8px;">
             <input type="text" id="np-name" placeholder="Name">
@@ -293,7 +298,7 @@
         <div class="empty" id="rec-empty">Nothing computed yet — click "Generate AI note".</div>
       </div>
     </div>
-    <!-- DASHBOARD TAB -->
+        <!-- DASHBOARD TAB -->
     <div class="tab-content" id="tab-dashboard">
       <div class="panel">
         <div class="toolbar">
@@ -305,12 +310,18 @@
             <button class="btn small secondary" data-period="year" onclick="setDashboardPeriod('year')">Year</button>
           </div>
         </div>
-        <div id="dash-products-list"></div>
+        <div style="height:280px; position:relative;">
+          <canvas id="dash-chart-products"></canvas>
+        </div>
+        <div id="dash-products-list" style="margin-top:16px"></div>
         <div class="empty" id="dash-products-empty" style="display:none">No sales in this period yet.</div>
       </div>
       <div class="panel">
         <h3>Top categories</h3>
-        <div id="dash-categories-list"></div>
+        <div style="height:280px; position:relative;">
+          <canvas id="dash-chart-categories"></canvas>
+        </div>
+        <div id="dash-categories-list" style="margin-top:16px"></div>
         <div class="empty" id="dash-categories-empty" style="display:none">No sales in this period yet.</div>
       </div>
     </div>
@@ -455,10 +466,59 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
 
 // ── Dashboard ─────────────────────────────────────────────────────────
 let currentDashboardPeriod = 'week';
+let dashProductsChart = null;
+let dashCategoriesChart = null;
+const CHART_PALETTE = ['#f5a623', '#3ddc84', '#5aa9ff', '#ff5c5c', '#c792ea', '#4fd1c5', '#f78fb3', '#a3e635', '#fbbf24', '#60a5fa'];
 
 function setDashboardPeriod(period) {
   currentDashboardPeriod = period;
   loadDashboard();
+}
+
+function renderDashboardCharts(data) {
+  if (dashProductsChart) { dashProductsChart.destroy(); dashProductsChart = null; }
+  if (dashCategoriesChart) { dashCategoriesChart.destroy(); dashCategoriesChart = null; }
+
+  if (data.topProducts.length) {
+    const products = data.topProducts.slice(0, 8);
+    dashProductsChart = new Chart(document.getElementById('dash-chart-products'), {
+      type: 'bar',
+      data: {
+        labels: products.map((p) => p.name),
+        datasets: [{ label: 'Units sold', data: products.map((p) => p.qty_sold), backgroundColor: '#f5a623', borderRadius: 4 }],
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#8b93a1' }, grid: { color: '#262b33' } },
+          y: { ticks: { color: '#e7e9ec' }, grid: { display: false } },
+        },
+      },
+    });
+  }
+
+  if (data.topCategories.length) {
+    dashCategoriesChart = new Chart(document.getElementById('dash-chart-categories'), {
+      type: 'doughnut',
+      data: {
+        labels: data.topCategories.map((c) => c.category),
+        datasets: [{
+          data: data.topCategories.map((c) => c.qty_sold),
+          backgroundColor: data.topCategories.map((_, i) => CHART_PALETTE[i % CHART_PALETTE.length]),
+          borderColor: '#14171c',
+          borderWidth: 2,
+        }],
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: 'right', labels: { color: '#e7e9ec' } } },
+      },
+    });
+  }
 }
 
 async function loadDashboard() {
@@ -475,6 +535,7 @@ async function loadDashboard() {
 
   try {
     const data = await api('/api/dashboard?period=' + currentDashboardPeriod);
+    renderDashboardCharts(data);
 
     if (!data.topProducts.length) {
       prodEmpty.textContent = 'No sales in this period yet.';
@@ -851,6 +912,21 @@ async function deleteProduct(id, btn) {
     alert(err.message);
     btn.disabled = false;
     btn.textContent = 'Delete';
+  }
+}
+
+async function recategorizeProducts() {
+  const status = document.getElementById('recategorize-status');
+  status.style.display = 'block';
+  status.textContent = 'Reviewing categories…';
+  try {
+    const result = await api('/api/products/recategorize', { method: 'POST' });
+    status.textContent = result.total === 0
+      ? 'Nothing to recategorize — no products are sitting in "General".'
+      : `Recategorized ${result.updated} of ${result.total} product(s).`;
+    await loadProducts();
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
   }
 }
 
