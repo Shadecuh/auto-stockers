@@ -683,11 +683,17 @@ async function generateRecs() {
       const eventNote = r.event_boost
         ? `<div class="meta" style="color:var(--amber)">📅 ${r.event_boost.reason}</div>`
         : '';
+      // event_boost_qty is how much of recommended_qty is attributable to the
+      // calendar event — only worth showing when it's actually nonzero.
+      const boostBreakdown = (r.event_boost && r.event_boost_qty > 0)
+        ? `<div class="meta">baseline +${r.baseline_qty}, event boost +${r.event_boost_qty}</div>`
+        : '';
       div.innerHTML = `
         <div>
           <div class="name">${r.name}</div>
           <div class="meta">${r.days_of_stock_left === null ? 'no recent sales data' : r.days_of_stock_left.toFixed(1) + ' days of stock left'}</div>
           ${eventNote}
+          ${boostBreakdown}
         </div>
         <div class="rec-qty">+${r.recommended_qty}</div>
       `;
