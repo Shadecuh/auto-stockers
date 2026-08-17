@@ -794,12 +794,21 @@ export default {
         const events = await fetchUpcomingEvents(env, companyId);
         const boosts = await getEventDemandBoosts(env, categories, events);
         const recs = products
-          .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
+          .map((p) => {
+            const rec = computeRecommendation(p, boosts[p.category]);
+            // Recompute with no event boost so the UI can show how much of
+            // recommendedQty is attributable to the calendar event vs. the
+            // product's own baseline demand.
+            const baselineQty = boosts[p.category] ? computeRecommendation(p).recommendedQty : rec.recommendedQty;
+            return { product: p, rec, baselineQty };
+          })
           .filter((r) => r.rec.needsReorder)
           .sort((a, b) => a.rec.daysOfStockLeft - b.rec.daysOfStockLeft);
         return json(recs.map((r) => ({
           product_id: r.product.id, name: r.product.name, category: r.product.category,
           current_stock: r.product.current_stock, ...r.rec,
+          baseline_qty: r.baselineQty,
+          event_boost_qty: r.rec.recommendedQty - r.baselineQty,
         })));
       }
 
@@ -811,7 +820,14 @@ export default {
         const events = await fetchUpcomingEvents(env, companyId);
         const boosts = await getEventDemandBoosts(env, categories, events);
         const needing = products
-          .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
+          .map((p) => {
+            const rec = computeRecommendation(p, boosts[p.category]);
+            // Recompute with no event boost so the UI can show how much of
+            // recommendedQty is attributable to the calendar event vs. the
+            // product's own baseline demand.
+            const baselineQty = boosts[p.category] ? computeRecommendation(p).recommendedQty : rec.recommendedQty;
+            return { product: p, rec, baselineQty };
+          })
           .filter((r) => r.rec.needsReorder)
           .sort((a, b) => a.rec.daysOfStockLeft - b.rec.daysOfStockLeft);
 
@@ -823,7 +839,7 @@ export default {
           `- ${r.product.name} (${r.product.category}): ${r.product.current_stock} on hand, ` +
           `~${r.rec.forecastPerDay.toFixed(2)}/day demand, ${r.rec.daysOfStockLeft === Infinity ? 'no recent sales' : r.rec.daysOfStockLeft.toFixed(1) + ' days left'}, ` +
           `recommend ordering ${r.rec.recommendedQty} units (lead time ${r.product.lead_time_days}d)` +
-          `${r.rec.eventBoost ? ` — boosted due to: ${r.rec.eventBoost.reason}` : ''}.`
+          `${r.rec.eventBoost ? ` — boosted due to: ${r.rec.eventBoost.reason} (baseline would have been ${r.baselineQty} units)` : ''}.`
         ).join('\n');
 
         const prompt = `You are drafting a short internal restock note for a small shop owner based on this computed reorder data:\n\n${lines}\n\nWrite a brief (under 150 words), plain-English summary a busy owner can skim: what to order first (most urgent), roughly how much, and one sentence noting any items trending up or boosted by an upcoming calendar event. Do not repeat every number — hit the highlights. No markdown headers.`;
@@ -844,6 +860,7 @@ export default {
           summary,
           items: needing.map((r) => ({
             product_id: r.product.id, name: r.product.name, recommended_qty: r.rec.recommendedQty,
+            baseline_qty: r.baselineQty, event_boost_qty: r.rec.recommendedQty - r.baselineQty,
             days_of_stock_left: r.rec.daysOfStockLeft, reasoning: r.rec.reasoning, event_boost: r.rec.eventBoost,
           })),
         });
