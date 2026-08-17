@@ -67,14 +67,46 @@
   header.top .logo small { color: var(--text-dim); font-weight: 400; font-size: 0.65rem; display: block; margin-top: 2px; letter-spacing: 1px; }
   header.top .company-name { color: var(--text-dim); font-size: 0.8rem; }
 
-  nav.tabs { display: flex; gap: 4px; padding: 12px 24px 0; border-bottom: 1px solid var(--border); }
+    nav.tabs {
+    display: flex; gap: 4px; padding: 12px 24px 0; border-bottom: 1px solid var(--border);
+    overflow-x: auto; -webkit-overflow-scrolling: touch; scrollbar-width: none;
+  }
+  nav.tabs::-webkit-scrollbar { display: none; }
   nav.tabs button {
     background: none; border: none; color: var(--text-dim); font-family: 'Space Grotesk', sans-serif;
     font-weight: 700; padding: 10px 16px; cursor: pointer; border-bottom: 2px solid transparent; font-size: 0.9rem;
+    white-space: nowrap; flex-shrink: 0;
   }
   nav.tabs button.active { color: var(--amber); border-bottom-color: var(--amber); }
 
   main { padding: 24px; max-width: 1100px; margin: 0 auto; }
+
+  /* ── Mobile ─────────────────────────────────────────────── */
+  @media (max-width: 640px) {
+    main { padding: 12px; }
+    .panel { padding: 14px; }
+    header.top { padding: 12px 16px; }
+    .toolbar { gap: 8px; }
+    .add-product-grid { grid-template-columns: 1fr !important; }
+
+    /* Turn data tables into stacked cards instead of clipping columns
+       off the right edge of the screen. */
+    table.responsive, table.responsive thead, table.responsive tbody,
+    table.responsive th, table.responsive td, table.responsive tr { display: block; }
+    table.responsive thead { position: absolute; left: -9999px; top: -9999px; }
+    table.responsive tr {
+      border: 1px solid var(--border); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px;
+    }
+    table.responsive td {
+      border: none; padding: 6px 0; display: flex; justify-content: space-between; align-items: center; gap: 10px;
+    }
+    table.responsive td::before {
+      content: attr(data-label); color: var(--text-dim); font-size: 0.7rem;
+      text-transform: uppercase; letter-spacing: 0.5px; flex-shrink: 0;
+    }
+    table.responsive td:empty { display: none; }
+    table.responsive .row-actions { justify-content: flex-end; width: 100%; }
+  }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 20px; margin-bottom: 20px; }
   .panel h3 { margin: 0 0 12px; font-size: 1rem; color: var(--text); }
   .muted { color: var(--text-dim); font-size: 0.85rem; }
@@ -110,7 +142,7 @@
   .badge.ok { background: rgba(61,220,132,.15); color: var(--green); }
   .badge.low { background: rgba(245,166,35,.15); color: var(--amber); }
   .badge.critical { background: rgba(255,92,92,.15); color: var(--red); }
-  .row-actions { display: flex; gap: 6px; }
+  .row-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 
   /* ── Inventory tab ──────────────────────────────────────── */
   .stock-bar { height: 6px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin-top: 4px; width: 90px; }
@@ -176,6 +208,7 @@
     <button class="tab-btn active" data-tab="scan">Scan Receipt</button>
     <button class="tab-btn" data-tab="inventory">Inventory</button>
     <button class="tab-btn" data-tab="recs">Recommendations</button>
+    <button class="tab-btn" data-tab="receipts">Receipts</button>
     <button class="tab-btn" data-tab="calendar">Calendar</button>
   </nav>
 
@@ -208,7 +241,7 @@
       <div class="panel" id="review-panel" style="display:none">
         <h3>2. Confirm what was matched</h3>
         <p class="muted" id="receipt-meta"></p>
-        <table>
+        <table class="responsive">
           <thead><tr><th>Receipt text</th><th>Qty</th><th>Match</th><th></th></tr></thead>
           <tbody id="review-rows"></tbody>
         </table>
@@ -227,7 +260,7 @@
           <button class="btn small" style="margin-left:auto" onclick="showAddProduct()">+ Add product</button>
         </div>
         <div id="add-product-form" style="display:none; margin-bottom:16px; padding:14px; background:var(--panel-2); border-radius:8px;">
-          <div style="display:grid; grid-template-columns:2fr 1fr 1fr 1fr auto; gap:8px;">
+          <div class="add-product-grid" style="display:grid; grid-template-columns:2fr 1fr 1fr 1fr auto; gap:8px;">
             <input type="text" id="np-name" placeholder="Name">
             <input type="text" id="np-category" placeholder="Category">
             <input type="number" id="np-price" placeholder="Unit price" step="0.01">
@@ -235,7 +268,7 @@
             <button class="btn small" onclick="addProduct()">Add</button>
           </div>
         </div>
-        <table>
+        <table class="responsive">
           <thead><tr><th>Item</th><th>Stock</th><th>Demand</th><th>Status</th><th>Lead time</th><th></th></tr></thead>
           <tbody id="product-rows"></tbody>
         </table>
@@ -248,11 +281,26 @@
       <div class="panel">
         <div class="toolbar">
           <h3 style="margin:0">Restock recommendations</h3>
-          <button class="btn small" style="margin-left:auto" onclick="generateRecs()">Generate AI note</button>
+          <div style="margin-left:auto; display:flex; gap:8px">
+            <button class="btn small" onclick="generateRecs()">Generate AI note</button>
+            <button class="btn small" onclick="autoReorder()">Auto-reorder now</button>
+          </div>
         </div>
+        <div id="auto-reorder-status" class="muted" style="margin-top:8px; display:none"></div>
         <div id="ai-summary" style="display:none"></div>
         <div id="rec-list" style="margin-top:16px"></div>
         <div class="empty" id="rec-empty">Nothing computed yet — click "Generate AI note".</div>
+      </div>
+    </div>
+    <!-- RECEIPTS TAB -->
+    <div class="tab-content" id="tab-receipts">
+      <div class="panel">
+        <div class="toolbar">
+          <h3 style="margin:0">Receipt history</h3>
+          <button class="btn small" style="margin-left:auto" onclick="loadReceipts()">Refresh</button>
+        </div>
+        <div id="receipts-list" style="margin-top:16px"></div>
+        <div class="empty" id="receipts-empty" style="display:none">No receipts yet.</div>
       </div>
     </div>
     <!-- CALENDAR TAB -->
@@ -378,8 +426,37 @@ document.querySelectorAll('.tab-btn').forEach((btn) => {
     document.getElementById('tab-' + btn.dataset.tab).classList.add('active');
     if (btn.dataset.tab === 'inventory') loadProducts();
     if (btn.dataset.tab === 'calendar') loadCalendarTab();
+    if (btn.dataset.tab === 'receipts') loadReceipts();
   });
 });
+
+// ── Receipts ──────────────────────────────────────────────────────────
+async function loadReceipts() {
+  const list = document.getElementById('receipts-list');
+  const empty = document.getElementById('receipts-empty');
+  list.innerHTML = '';
+  try {
+    const receipts = await api('/api/receipts');
+    if (!receipts.length) { empty.style.display = 'block'; return; }
+    empty.style.display = 'none';
+    receipts.forEach((r) => {
+      const div = document.createElement('div');
+      div.className = 'rec-item';
+      const typeLabel = r.receipt_type === 'purchase' ? '📦 Purchase' : '🧾 Sale';
+      const typeColor = r.receipt_type === 'purchase' ? 'var(--amber)' : 'inherit';
+      const statusBadge = r.status === 'confirmed' ? '' : ' · pending';
+      div.innerHTML = `
+        <div>
+          <div class="name">${r.vendor || 'Unknown vendor'}</div>
+          <div class="meta" style="color:${typeColor}">${typeLabel} · ${r.item_count} item(s)${statusBadge}</div>
+          <div class="meta">${r.receipt_date || r.uploaded_at.slice(0, 10)}</div>
+        </div>
+        <div class="rec-qty">${r.receipt_type === 'purchase' ? '+' : '-'}${r.total_qty}</div>
+      `;
+      list.appendChild(div);
+    });
+  } catch (err) { console.error(err); empty.style.display = 'block'; }
+}
 
 // ── Calendar ──────────────────────────────────────────────────────────
 async function loadCalendarTab() {
@@ -543,9 +620,9 @@ function renderReview() {
 
     const confPct = Math.round((item.match_confidence || 0) * 100);
     tr.innerHTML = `
-      <td>${item.raw_text}</td>
-      <td><input type="number" value="${item.qty}" min="1" style="width:60px" data-role="qty"></td>
-      <td>
+      <td data-label="Receipt text">${item.raw_text}</td>
+      <td data-label="Qty"><input type="number" value="${item.qty}" min="1" style="width:60px" data-role="qty"></td>
+      <td data-label="Match">
         <select data-role="match">
           <option value="">— new product —</option>
           ${options}
@@ -629,16 +706,53 @@ function renderProducts(products) {
     const barColor = p.needsReorder ? (p.current_stock === 0 ? 'var(--red)' : 'var(--amber)') : 'var(--green)';
 
     const tr = document.createElement('tr');
+    tr.dataset.productId = p.id;
     tr.innerHTML = `
-      <td><strong>${p.name}</strong><div class="muted">${p.category}</div></td>
-      <td>${p.current_stock}<div class="stock-bar"><div style="width:${barPct}%; background:${barColor}"></div></div></td>
-      <td><span class="trend ${trendClass}">${trendArrow} ${p.forecastPerDay.toFixed(2)}/day</span></td>
-      <td>${badge}</td>
-      <td>${p.lead_time_days}d</td>
-      <td><button class="btn small secondary" onclick="deleteProduct(${p.id}, this)">Delete</button></td>
+      <td data-label="Item"><strong>${p.name}</strong><div class="muted">${p.category}</div></td>
+      <td class="view-mode" data-label="Stock">${p.current_stock}<div class="stock-bar"><div style="width:${barPct}%; background:${barColor}"></div></div></td>
+      <td class="edit-mode" data-label="Stock" style="display:none"><input type="number" data-role="edit-stock" value="${p.current_stock}" style="width:80px"></td>
+      <td data-label="Demand"><span class="trend ${trendClass}">${trendArrow} ${p.forecastPerDay.toFixed(2)}/day</span></td>
+      <td data-label="Status">${badge}</td>
+      <td data-label="Lead time">${p.lead_time_days}d</td>
+      <td class="row-actions">
+        <button class="btn small secondary view-mode" onclick="editProduct(${p.id})">Edit</button>
+        <button class="btn small" style="display:none" onclick="saveProduct(${p.id}, this)">Save</button>
+        <button class="btn small secondary" onclick="cancelEditProduct(${p.id})" style="display:none">Cancel</button>
+        <button class="btn small secondary" onclick="deleteProduct(${p.id}, this)">Delete</button>
+      </td>
     `;
     rows.appendChild(tr);
   });
+}
+
+function editProduct(id) {
+  const tr = document.querySelector(`tr[data-product-id="${id}"]`);
+  tr.querySelectorAll('.view-mode').forEach((el) => (el.style.display = 'none'));
+  tr.querySelectorAll('.edit-mode').forEach((el) => (el.style.display = ''));
+  const saveBtn = tr.querySelector('button[onclick^="saveProduct"]');
+  const cancelBtn = tr.querySelector('button[onclick^="cancelEditProduct"]');
+  saveBtn.style.display = '';
+  cancelBtn.style.display = '';
+}
+
+function cancelEditProduct(id) {
+  loadProducts(); // simplest way back to a clean view-mode row
+}
+
+async function saveProduct(id, btn) {
+  const tr = document.querySelector(`tr[data-product-id="${id}"]`);
+  const newStock = Number(tr.querySelector('[data-role="edit-stock"]').value);
+  if (Number.isNaN(newStock) || newStock < 0) { alert('Enter a valid stock number.'); return; }
+  btn.disabled = true;
+  btn.textContent = '…';
+  try {
+    await api(`/api/products/${id}`, { method: 'PUT', body: JSON.stringify({ current_stock: newStock }) });
+    await loadProducts();
+  } catch (err) {
+    alert(err.message);
+    btn.disabled = false;
+    btn.textContent = 'Save';
+  }
 }
 
 async function deleteProduct(id, btn) {
@@ -681,6 +795,30 @@ async function addProduct() {
 }
 
 // ── Recommendations ──────────────────────────────────────────────────
+async function autoReorder() {
+  const status = document.getElementById('auto-reorder-status');
+  status.style.display = 'block';
+  status.textContent = 'Drafting reorder…';
+  try {
+    const result = await api('/api/recommendations/auto-reorder', { method: 'POST' });
+    if (!result.receipt) {
+      status.textContent = 'Nothing needs reordering right now.';
+      return;
+    }
+    // Drop the draft straight into the existing Scan-tab review screen —
+    // same flow as a manually scanned receipt, items already pre-matched.
+    currentReceipt = result.receipt;
+    currentItems = result.items;
+    await loadProductsQuietly();
+    document.querySelector('[data-tab="scan"]').click();
+    renderReview();
+    status.textContent = '';
+    status.style.display = 'none';
+  } catch (err) {
+    status.textContent = 'Error: ' + err.message;
+  }
+}
+
 async function generateRecs() {
   const summaryBox = document.getElementById('ai-summary');
   const list = document.getElementById('rec-list');
