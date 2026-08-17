@@ -499,6 +499,50 @@ Omit any category you're not reasonably confident about. Multipliers should be m
   }
 }
 
+// ─── Auto-reorder ───────────────────────────────────────────────────────
+// Computes recommendations (baseline demand + event boosts, same math as
+// /api/recommendations) and, for every item at/below its reorder point,
+// creates a DRAFT purchase receipt — items already matched to the correct
+// product at the recommended quantity, but status stays 'pending' and
+// stock is NOT touched yet. The owner reviews it in the normal Scan tab
+// review screen and clicks "Confirm & log sales" to actually apply it,
+// same as any manually scanned receipt. This is intentionally NOT
+// auto-confirmed — a bad calendar read or skewed demand model should never
+// silently change stock without a human looking at it first.
+async function buildAutoReorderDraft(env: Env, companyId: number) {
+  const { results } = await env.DB.prepare(
+    'SELECT * FROM products WHERE company_id = ? AND archived = 0'
+  ).bind(companyId).all<ProductRow>();
+  const products = results ?? [];
+  if (products.length === 0) return { receipt: null, items: [] as any[] };
+
+  const categories = [...new Set(products.map((p) => p.category))];
+  const events = await fetchUpcomingEvents(env, companyId);
+  const boosts = await getEventDemandBoosts(env, categories, events);
+
+  const needing = products
+    .map((p) => ({ product: p, rec: computeRecommendation(p, boosts[p.category]) }))
+    .filter((r) => r.rec.needsReorder && r.rec.recommendedQty > 0);
+
+  if (needing.length === 0) return { receipt: null, items: [] as any[] };
+
+  const receipt = await env.DB.prepare(
+    `INSERT INTO receipts (company_id, vendor, receipt_date, status, receipt_type)
+     VALUES (?, 'Auto-Reorder (draft)', ?, 'pending', 'purchase') RETURNING *`
+  ).bind(companyId, new Date().toISOString().slice(0, 10)).first<any>();
+
+  const itemsOut = [];
+  for (const r of needing) {
+    const row = await env.DB.prepare(
+      `INSERT INTO receipt_items (company_id, receipt_id, raw_text, qty, unit_price, suggested_product_id, match_confidence, resolved_product_id, status)
+       VALUES (?, ?, ?, ?, ?, ?, 1, ?, 'matched') RETURNING *`
+    ).bind(companyId, receipt.id, r.product.name, r.rec.recommendedQty, r.product.unit_price, r.product.id, r.product.id).first<any>();
+    itemsOut.push({ ...row, suggested_product_name: r.product.name, event_boost: r.rec.eventBoost ?? null });
+  }
+
+  return { receipt, items: itemsOut };
+}
+
 // ─── Worker ─────────────────────────────────────────────────────────────
 
 export default {
@@ -614,6 +658,22 @@ export default {
         }
 
         return json({ receipt, items: itemsOut });
+      }
+
+      // GET /api/receipts — history list for the new Receipts tab. Newest
+      // first, with item count so the list can show something useful
+      // without a second request per row.
+      if (path === '/api/receipts' && req.method === 'GET') {
+        const { results } = await env.DB.prepare(
+          `SELECT r.*,
+             (SELECT COUNT(*) FROM receipt_items ri WHERE ri.receipt_id = r.id AND ri.company_id = r.company_id) AS item_count,
+             (SELECT COALESCE(SUM(ri.qty), 0) FROM receipt_items ri WHERE ri.receipt_id = r.id AND ri.company_id = r.company_id AND ri.status = 'matched') AS total_qty
+           FROM receipts r
+           WHERE r.company_id = ?
+           ORDER BY r.uploaded_at DESC
+           LIMIT 100`
+        ).bind(companyId).all();
+        return json(results ?? []);
       }
 
       // GET /api/receipts/:id — review a scanned receipt
@@ -734,6 +794,37 @@ export default {
         return json(events);
       }
 
+      // GET /api/dashboard?period=day|week|month|year — top-selling
+      // products and categories over the selected window. Reads only
+      // sales_log, so this reflects confirmed SALE receipts — purchases
+      // (restocking) don't count toward "selling," which is the point.
+      if (path === '/api/dashboard' && req.method === 'GET') {
+        const period = url.searchParams.get('period') || 'week';
+        const daysMap: Record<string, number> = { day: 1, week: 7, month: 30, year: 365 };
+        const days = daysMap[period] ?? 7;
+        const cutoff = new Date(Date.now() - days * 86400000).toISOString().slice(0, 10);
+
+        const { results: topProducts } = await env.DB.prepare(
+          `SELECT p.id AS product_id, p.name, p.category, SUM(sl.qty) AS qty_sold, COUNT(*) AS sale_count
+           FROM sales_log sl JOIN products p ON p.id = sl.product_id
+           WHERE sl.company_id = ? AND sl.sale_date >= ?
+           GROUP BY p.id
+           ORDER BY qty_sold DESC
+           LIMIT 10`
+        ).bind(companyId, cutoff).all();
+
+        const { results: topCategories } = await env.DB.prepare(
+          `SELECT p.category, SUM(sl.qty) AS qty_sold
+           FROM sales_log sl JOIN products p ON p.id = sl.product_id
+           WHERE sl.company_id = ? AND sl.sale_date >= ?
+           GROUP BY p.category
+           ORDER BY qty_sold DESC
+           LIMIT 10`
+        ).bind(companyId, cutoff).all();
+
+        return json({ period, days, topProducts: topProducts ?? [], topCategories: topCategories ?? [] });
+      }
+
       // GET /api/products
       if (path === '/api/products' && req.method === 'GET') {
         const { results } = await env.DB.prepare(
@@ -784,6 +875,16 @@ export default {
 
         await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ? AND company_id = ?').bind(id, companyId).run();
         return json({ deleted: false, archived: true });
+      }
+
+      // POST /api/recommendations/auto-reorder — builds a DRAFT purchase
+      // receipt for every item at/below reorder point. Nothing is
+      // confirmed here — the frontend drops the returned receipt into the
+      // normal review screen so the owner can look it over before stock
+      // actually changes.
+      if (path === '/api/recommendations/auto-reorder' && req.method === 'POST') {
+        const result = await buildAutoReorderDraft(env, companyId);
+        return json(result);
       }
 
       // GET /api/recommendations — compute fresh recs for items at/below reorder point
@@ -882,6 +983,21 @@ export default {
     } catch (err: any) {
       console.error('[auto-stockers] error', err);
       return json({ error: err?.message || 'Server error' }, 500);
+    }
+  },
+
+  // Runs on the cron schedule set in wrangler.toml. Loops every tenant —
+  // one Worker, one D1 database, every company gets auto-reordered
+  // independently, same isolation rule as everything else in this file.
+  async scheduled(_event: ScheduledEvent, env: Env, ctx: ExecutionContext) {
+    const { results: companies } = await env.DB.prepare('SELECT id FROM companies').all<{ id: number }>();
+    for (const c of companies ?? []) {
+      try {
+        const result = await buildAutoReorderDraft(env, c.id);
+        if (result.items.length > 0) console.log(`[auto-reorder] company ${c.id}: drafted ${result.items.length} item(s), awaiting review`);
+      } catch (err) {
+        console.error(`[auto-reorder] failed for company ${c.id}`, err);
+      }
     }
   },
 };
