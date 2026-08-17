@@ -499,6 +499,40 @@ Omit any category you're not reasonably confident about. Multipliers should be m
   }
 }
 
+// ─── AI category classification ────────────────────────────────────────
+// Every new product otherwise defaults to a flat "General" category,
+// which makes the dashboard's category breakdown useless. This asks Gemma
+// to pick a short, consistent category per product — reusing the
+// company's existing categories where they genuinely fit (so "Cables"
+// doesn't fragment into "Cable" / "Cabling" / "Wires" over time), and
+// only inventing a new one when nothing fits.
+async function categorizeProductsBatch(
+  env: Env, companyId: number, items: { id: string | number; name: string }[]
+): Promise<Record<string, string>> {
+  if (items.length === 0) return {};
+
+  const { results: existing } = await env.DB.prepare(
+    `SELECT DISTINCT category FROM products WHERE company_id = ? AND category != 'General'`
+  ).bind(companyId).all<{ category: string }>();
+  const existingCategories = (existing ?? []).map((r) => r.category);
+
+  const prompt = `Classify each product below into a short, consistent category (1-2 words) a shop owner would use to browse inventory — for example "Cables", "Peripherals", "Components", "Storage", "Networking", "Power", "Tools", "Accessories". Reuse one of these existing categories if it genuinely fits: ${existingCategories.length ? existingCategories.join(', ') : '(none yet)'}. Only invent a new category if nothing existing fits. Avoid "General" unless the product is truly miscellaneous.
+
+Products:
+${items.map((it) => `${it.id}: ${it.name}`).join('\n')}
+
+Return ONLY a JSON object mapping each id (as a string key) to its category, no markdown, no explanation. Example: {"12": "Cables", "13": "Peripherals"}`;
+
+  try {
+    const raw = await callGemmaText(env, prompt);
+    const clean = raw.replace(/```json|```/g, '').trim();
+    const parsed = JSON.parse(clean);
+    return typeof parsed === 'object' && parsed ? parsed : {};
+  } catch {
+    return {}; // classification failure should never break product creation
+  }
+}
+
 // ─── Auto-reorder ───────────────────────────────────────────────────────
 // Computes recommendations (baseline demand + event boosts, same math as
 // /api/recommendations) and, for every item at/below its reorder point,
@@ -714,10 +748,15 @@ export default {
         if (body.action === 'new_product') {
           const name = (body.name || '').trim();
           if (!name) return json({ error: 'name required for new_product' }, 400);
+          let category = body.category?.trim();
+          if (!category) {
+            const guesses = await categorizeProductsBatch(env, companyId, [{ id: 'new', name }]);
+            category = guesses['new'] || 'General';
+          }
           const created = await env.DB.prepare(
             `INSERT INTO products (company_id, name, normalized_name, category, unit_price, current_stock, lead_time_days)
              VALUES (?, ?, ?, ?, ?, 0, ?) RETURNING *`
-          ).bind(companyId, name, normalizeText(name), body.category || 'General', body.unit_price || 0, body.lead_time_days || 3).first();
+          ).bind(companyId, name, normalizeText(name), category, body.unit_price || 0, body.lead_time_days || 3).first();
           productId = (created as any).id;
         } else if (productId) {
           // matching to an existing product — make sure it's actually this company's product
@@ -834,14 +873,19 @@ export default {
         return json(withRecs);
       }
 
-      // POST /api/products — manual add
+            // POST /api/products — manual add
       if (path === '/api/products' && req.method === 'POST') {
         const b = await req.json() as { name: string; category?: string; unit_price?: number; current_stock?: number; lead_time_days?: number };
         if (!b.name?.trim()) return json({ error: 'name required' }, 400);
+        let category = b.category?.trim();
+        if (!category) {
+          const guesses = await categorizeProductsBatch(env, companyId, [{ id: 'new', name: b.name.trim() }]);
+          category = guesses['new'] || 'General';
+        }
         const row = await env.DB.prepare(
           `INSERT INTO products (company_id, name, normalized_name, category, unit_price, current_stock, lead_time_days)
            VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
-        ).bind(companyId, b.name.trim(), normalizeText(b.name), b.category || 'General', b.unit_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
+        ).bind(companyId, b.name.trim(), normalizeText(b.name), category, b.unit_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
         return json(row, 201);
       }
 
@@ -875,6 +919,27 @@ export default {
 
         await env.DB.prepare('UPDATE products SET archived = 1 WHERE id = ? AND company_id = ?').bind(id, companyId).run();
         return json({ deleted: false, archived: true });
+      }
+
+            // POST /api/products/recategorize — batch re-classifies every
+      // product currently sitting in the default "General" bucket.
+      if (path === '/api/products/recategorize' && req.method === 'POST') {
+        const { results } = await env.DB.prepare(
+          `SELECT id, name FROM products WHERE company_id = ? AND archived = 0 AND category = 'General'`
+        ).bind(companyId).all<{ id: number; name: string }>();
+        const products = results ?? [];
+        if (products.length === 0) return json({ updated: 0, total: 0 });
+
+        const guesses = await categorizeProductsBatch(env, companyId, products.map((p) => ({ id: p.id, name: p.name })));
+        let updated = 0;
+        for (const p of products) {
+          const category = guesses[String(p.id)];
+          if (category && category !== 'General') {
+            await env.DB.prepare('UPDATE products SET category = ? WHERE id = ? AND company_id = ?').bind(category, p.id, companyId).run();
+            updated++;
+          }
+        }
+        return json({ updated, total: products.length });
       }
 
       // POST /api/recommendations/auto-reorder — builds a DRAFT purchase
