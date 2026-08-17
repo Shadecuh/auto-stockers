@@ -854,7 +854,11 @@ function renderProducts(products) {
     const tr = document.createElement('tr');
     tr.dataset.productId = p.id;
     tr.innerHTML = `
-      <td data-label="Item"><strong>${p.name}</strong><div class="muted">${p.category}</div></td>
+      <td data-label="Item" class="view-mode"><strong>${p.name}</strong><div class="muted">${p.category}</div></td>
+      <td data-label="Item" class="edit-mode" style="display:none">
+        <strong>${p.name}</strong>
+        <input type="text" data-role="edit-category" value="${p.category}" style="margin-top:6px; width:120px" placeholder="Category">
+      </td>
       <td class="view-mode" data-label="Stock">${p.current_stock}<div class="stock-bar"><div style="width:${barPct}%; background:${barColor}"></div></div></td>
       <td class="edit-mode" data-label="Stock" style="display:none"><input type="number" data-role="edit-stock" value="${p.current_stock}" style="width:80px"></td>
       <td data-label="Demand"><span class="trend ${trendClass}">${trendArrow} ${p.forecastPerDay.toFixed(2)}/day</span></td>
@@ -888,11 +892,13 @@ function cancelEditProduct(id) {
 async function saveProduct(id, btn) {
   const tr = document.querySelector(`tr[data-product-id="${id}"]`);
   const newStock = Number(tr.querySelector('[data-role="edit-stock"]').value);
+  const newCategory = tr.querySelector('[data-role="edit-category"]').value.trim();
   if (Number.isNaN(newStock) || newStock < 0) { alert('Enter a valid stock number.'); return; }
+  if (!newCategory) { alert('Category can\'t be empty.'); return; }
   btn.disabled = true;
   btn.textContent = '…';
   try {
-    await api(`/api/products/${id}`, { method: 'PUT', body: JSON.stringify({ current_stock: newStock }) });
+    await api(`/api/products/${id}`, { method: 'PUT', body: JSON.stringify({ current_stock: newStock, category: newCategory }) });
     await loadProducts();
   } catch (err) {
     alert(err.message);
