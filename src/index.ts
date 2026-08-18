@@ -436,6 +436,41 @@ async function buildBusinessSnapshot(env: Env, companyId: number) {
   const trendingUp = withRec.filter((p) => p.demand_trend > 0.05).sort((a, b) => b.demand_trend - a.demand_trend).slice(0, 5);
   const trendingDown = withRec.filter((p) => p.demand_trend < -0.05).sort((a, b) => a.demand_trend - b.demand_trend).slice(0, 5);
 
+  // Margin: real if a purchase receipt has scanned a cost_price, otherwise
+  // estimated at DEFAULT_MARGIN_PCT — same fallback the Products table
+  // uses, kept in sync so the assistant's numbers match what the owner sees.
+  const DEFAULT_MARGIN_PCT = 30;
+  const withMargin = (products ?? [])
+    .filter((p) => Number(p.unit_price) > 0)
+    .map((p) => {
+      const price = Number(p.unit_price);
+      const scannedCost = Number(p.cost_price) || 0;
+      const estimated = scannedCost <= 0;
+      const cost = estimated ? price * (1 - DEFAULT_MARGIN_PCT / 100) : scannedCost;
+      const marginDollars = price - cost;
+      const marginPct = estimated ? DEFAULT_MARGIN_PCT : Math.round((marginDollars / price) * 100);
+      return { id: p.id, name: p.name, category: p.category, price, cost, marginDollars, marginPct, estimated, current_stock: p.current_stock };
+    });
+  const topMargin = [...withMargin].sort((a, b) => b.marginDollars - a.marginDollars).slice(0, 10);
+  const totalCOGS = withMargin.reduce((sum, p) => sum + p.cost * p.current_stock, 0);
+  const cogsIsFullyEstimated = withMargin.every((p) => p.estimated);
+
+  // COST OF GOODS SOLD — what units actually sold in the last 30 days cost
+  // (as opposed to totalCOGS above, which values everything still on the
+  // shelf). Same real-vs-estimated cost per product, just multiplied by
+  // qty_sold instead of current_stock.
+  const costById = new Map(withMargin.map((p) => [p.id, p]));
+  let cogsSold30d = 0;
+  let soldItemsAllEstimated = true;
+  let anySoldItemsMatched = false;
+  for (const s of sales30 ?? []) {
+    const m = costById.get(s.id);
+    if (!m) continue;
+    anySoldItemsMatched = true;
+    cogsSold30d += m.cost * s.qty_sold;
+    if (!m.estimated) soldItemsAllEstimated = false;
+  }
+
   return {
     productCount: products?.length ?? 0,
     topSellers30d: (sales30 ?? []).slice(0, 10),
@@ -445,6 +480,11 @@ async function buildBusinessSnapshot(env: Env, companyId: number) {
     deadStock90d: deadStock.map((p) => ({ name: p.name, category: p.category, current_stock: p.current_stock })),
     trendingUp: trendingUp.map((p) => ({ name: p.name, trend: p.demand_trend.toFixed(2) })),
     trendingDown: trendingDown.map((p) => ({ name: p.name, trend: p.demand_trend.toFixed(2) })),
+    topMargin,
+    totalCOGS: Math.round(totalCOGS),
+    cogsIsFullyEstimated,
+    cogsSold30d: Math.round(cogsSold30d),
+    cogsSold30dEstimated: anySoldItemsMatched ? soldItemsAllEstimated : null, // null = no sales to measure
   };
 }
 
@@ -482,6 +522,16 @@ function formatSnapshotForPrompt(s: Awaited<ReturnType<typeof buildBusinessSnaps
     lines.push('\nTRENDING DOWN:');
     s.trendingDown.forEach((p) => lines.push(`- ${p.name} (trend ${p.trend}/day)`));
   }
+  if (s.topMargin.length) {
+    lines.push('\nHIGHEST PROFIT MARGIN (top 10, sorted by $ margin per unit):');
+    s.topMargin.forEach((p, i) => lines.push(
+      `${i + 1}. ${p.name} (${p.category}) — sells for $${p.price.toFixed(2)}, cost $${p.cost.toFixed(2)}, margin $${p.marginDollars.toFixed(2)} (${p.marginPct}%)${p.estimated ? ' [estimated cost — no purchase receipt scanned yet]' : ''}`
+    ));
+  }
+  lines.push(`\nTOTAL COST OF GOODS ON HAND (current stock valued at cost): $${s.totalCOGS.toLocaleString()}${s.cogsIsFullyEstimated ? ' [fully estimated — no items have a scanned purchase cost yet]' : ' [mix of scanned and estimated costs]'}`);
+  if (s.cogsSold30dEstimated !== null) {
+    lines.push(`COST OF GOODS SOLD (last 30 days, what sold units actually cost): $${s.cogsSold30d.toLocaleString()}${s.cogsSold30dEstimated ? ' [fully estimated]' : ' [mix of scanned and estimated costs]'}`);
+  }
   return lines.join('\n');
 }
 
@@ -491,6 +541,7 @@ Rules:
 1. Use ONLY the BUSINESS DATA block below as your source of numbers. Never invent a product name, quantity, or dollar figure that isn't in it.
 2. If the data needed to answer isn't in the BUSINESS DATA block, say so plainly rather than guessing.
 3. When asked "what should I buy less of" or similar, point to items in OVERSTOCKED or NO SALES IN 90+ DAYS, and explain why using the numbers given.
+3a. When asked about profit, margin, or "what makes me the most money," use the HIGHEST PROFIT MARGIN list — cost is already computed for you (real where scanned, otherwise estimated at a 70%-of-price default). Never recompute cost or margin yourself from the price alone. If asked specifically for "cost of goods sold" or "COGS," use the COST OF GOODS SOLD line (what units sold in the last 30 days actually cost) — do not substitute TOTAL COST OF GOODS ON HAND, which is a different number (current shelf inventory valued at cost, not sales). If the owner's phrasing is ambiguous between the two, briefly clarify which one you're answering. If a figure is marked estimated, say so plainly and mention that scanning a purchase receipt would make it exact.
 4. When asked about expansion ("what should I expand into"), reason from TOP CATEGORIES and TRENDING UP — suggest categories or adjacent products a shop like this could add, but be explicit that this is a suggestion based on their own sales pattern, not a guarantee.
 5. Be direct and concise — a busy owner is skimming this, not reading a report. Prefer short paragraphs or a few bullet points over long prose.
 6. You may reference recent conversation to resolve follow-ups like "why?" or "how much of that", but never treat prior conversation as a source of new facts.
@@ -540,8 +591,8 @@ const QUERY_WHITELIST: Record<string, { expr: string; label: string; filterable:
   lead_time_days:  { expr: 'lead_time_days',   label: 'Vendor lead time (days)', filterable: true },
   demand_level:    { expr: 'demand_level',     label: 'Demand (units/day)',  filterable: true },
   demand_trend:    { expr: 'demand_trend',     label: 'Demand trend',        filterable: true },
-  margin_pct:      { expr: '(CASE WHEN unit_price > 0 THEN ROUND((unit_price - cost_price) / unit_price * 100, 1) ELSE NULL END)', label: 'Margin %', filterable: true },
-  margin_dollars:  { expr: 'ROUND(unit_price - cost_price, 2)', label: 'Margin $', filterable: true },
+  margin_pct:      { expr: "(CASE WHEN unit_price > 0 THEN (CASE WHEN cost_price > 0 THEN ROUND((unit_price - cost_price) / unit_price * 100, 1) ELSE 30 END) ELSE NULL END)", label: 'Margin %', filterable: true },
+  margin_dollars:  { expr: '(CASE WHEN cost_price > 0 THEN ROUND(unit_price - cost_price, 2) ELSE ROUND(unit_price * 0.3, 2) END)', label: 'Margin $', filterable: true },
   days_of_stock:   { expr: '(CASE WHEN demand_level > 0.001 THEN ROUND(current_stock / demand_level, 1) ELSE NULL END)', label: 'Days of stock left', filterable: true },
 };
 const ALLOWED_OPS = new Set(['>', '<', '>=', '<=', '=', '!=']);
@@ -612,7 +663,10 @@ function buildFilteredQuery(columns: string[], filters: ViewFilter[], sort: View
     sql += ` AND ${QUERY_WHITELIST[f.field].expr} ${f.op} ?`;
     params.push(f.value);
   }
-  if (sort) sql += ` ORDER BY ${QUERY_WHITELIST[sort.field].expr} ${sort.direction === 'asc' ? 'ASC' : 'DESC'}`;
+  if (sort) {
+    sql += ` ORDER BY ${QUERY_WHITELIST[sort.field].expr} ${sort.direction === 'asc' ? 'ASC' : 'DESC'}`;
+    if (sort.field !== 'margin_dollars') sql += `, ${QUERY_WHITELIST.margin_dollars.expr} DESC`;
+  }
   sql += ` LIMIT ?`;
   params.push(limit);
 
@@ -651,6 +705,7 @@ For compare mode, "limit" applies PER GROUP (e.g. limit 10 means top 10 rows in 
 
 Rules:
 - "columns" must be a non-empty array of field keys from the list above. Always include "name" unless the owner clearly doesn't want it. Also always include ONE numeric field (demand_level, current_stock, unit_price, cost_price, margin_pct, margin_dollars, or days_of_stock) so the report can be charted — default to "demand_level" if the request doesn't make a metric obvious, unless the owner explicitly asked for only names/categories with no numbers.
+- margin_pct and margin_dollars are NOT interchangeable. margin_pct is the percentage rate — many items may share the exact same margin_pct (e.g. everything without a scanned cost defaults to the same estimated rate), so sorting by it alone can rank low-value items above high-value ones. margin_dollars is the actual profit per unit sold. For any request about which items make the most money, the biggest profit, or similar dollar-focused phrasing ("makes me the most money", "most profitable", "highest profit"), use margin_dollars as the sort field, not margin_pct. Only use margin_pct when the owner specifically asks about rate/percentage (e.g. "which items have the best margin percentage").
 - filters' op must be one of > < >= <= = !=.
 - "sort" is optional.
 - If the request doesn't map to these fields at all, return {"mode": "single", "columns": [], "filters": [], "sort": null, "limit": 50}.
@@ -1095,8 +1150,8 @@ export default {
 
         if (!productId) return json({ error: 'product_id required for match' }, 400);
         await env.DB.prepare(
-          'UPDATE receipt_items SET status = ?, resolved_product_id = ? WHERE id = ?'
-        ).bind('matched', productId, itemId).run();
+          'UPDATE receipt_items SET status = ?, resolved_product_id = ?, unit_price = COALESCE(?, unit_price) WHERE id = ?'
+        ).bind('matched', productId, body.unit_price ?? null, itemId).run();
         return json({ ok: true, product_id: productId });
       }
 
@@ -1117,15 +1172,19 @@ export default {
           const product = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(item.resolved_product_id, companyId).first<ProductRow>();
           if (!product) continue;
 
+          const scannedPrice = Number(item.unit_price) > 0 ? Number(item.unit_price) : null;
+
           if (isPurchase) {
             const newStock = product.current_stock + item.qty;
-            await env.DB.prepare('UPDATE products SET current_stock = ? WHERE id = ?').bind(newStock, product.id).run();
+            await env.DB.prepare(
+              'UPDATE products SET current_stock = ?, cost_price = COALESCE(?, cost_price) WHERE id = ?'
+            ).bind(newStock, scannedPrice, product.id).run();
           } else {
             const model = updateDemandModel(product, item.qty, saleDate);
             const newStock = Math.max(0, product.current_stock - item.qty);
             await env.DB.prepare(
-              `UPDATE products SET current_stock = ?, demand_level = ?, demand_trend = ?, demand_variance = ?, last_sale_date = ? WHERE id = ?`
-            ).bind(newStock, model.demand_level, model.demand_trend, model.demand_variance, saleDate, product.id).run();
+              `UPDATE products SET current_stock = ?, demand_level = ?, demand_trend = ?, demand_variance = ?, last_sale_date = ?, unit_price = COALESCE(?, unit_price) WHERE id = ?`
+            ).bind(newStock, model.demand_level, model.demand_trend, model.demand_variance, saleDate, scannedPrice, product.id).run();
             await env.DB.prepare(
               'INSERT INTO sales_log (company_id, product_id, qty, sale_date, receipt_item_id) VALUES (?, ?, ?, ?, ?)'
             ).bind(companyId, product.id, item.qty, saleDate, item.id).run();
