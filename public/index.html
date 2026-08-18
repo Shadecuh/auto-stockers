@@ -305,7 +305,7 @@
         <h3>2. Confirm what was matched</h3>
         <p class="muted" id="receipt-meta"></p>
         <table class="responsive">
-          <thead><tr><th>Receipt text</th><th>Qty</th><th>Match</th><th></th></tr></thead>
+          <thead><tr><th>Receipt text</th><th>Qty</th><th>Price</th><th>Match</th><th></th></tr></thead>
           <tbody id="review-rows"></tbody>
         </table>
         <div style="margin-top:16px; display:flex; gap:10px;">
@@ -337,7 +337,7 @@
           </div>
         </div>
         <table class="responsive">
-          <thead><tr><th>Item</th><th>Stock</th><th>Demand</th><th>Status</th><th>Lead time</th><th>Cost / Margin</th><th></th></tr></thead>
+          <thead><tr><th>Item</th><th>Stock</th><th>Demand</th><th>Status</th><th>Lead time</th><th>Price</th><th>Profit by part</th><th></th></tr></thead>
           <tbody id="product-rows"></tbody>
         </table>
         <div class="empty" id="product-empty" style="display:none">No products yet — scan a receipt or add one manually.</div>
@@ -421,7 +421,7 @@
     <div class="tab-content" id="tab-reports">
       <div class="panel">
         <h3>Ask for a report</h3>
-        <p class="muted">Describe what you want to see, in plain English — e.g. "products under 10 in stock", "lowest margin items", or "what's overdue to reorder given lead time". The AI only picks from a fixed set of known fields, so it can't run anything outside your own inventory data.</p>
+        <p class="muted">Describe what you want to see, in plain English — e.g. "products under 10 in stock", "lowest cost items", or "what's overdue to reorder given lead time". The AI only picks from a fixed set of known fields, so it can't run anything outside your own inventory data.</p>
         <div style="display:flex; gap:8px;">
           <input type="text" id="report-request" placeholder="e.g. items with margin under 20%" style="flex:1" onkeydown="if(event.key==='Enter') generateReport()">
           <button class="btn small" onclick="generateReport()">Generate</button>
@@ -1123,6 +1123,7 @@ function renderReview() {
     tr.innerHTML = `
       <td data-label="Receipt text">${item.raw_text}</td>
       <td data-label="Qty"><input type="number" value="${item.qty}" min="1" style="width:60px" data-role="qty"></td>
+      <td data-label="Price"><input type="number" value="${item.unit_price || ''}" min="0" step="0.01" style="width:80px" data-role="price" placeholder="0.00"></td>
       <td data-label="Match">
         <select data-role="match">
           <option value="">— new product —</option>
@@ -1151,9 +1152,11 @@ function renderReview() {
 async function resolveItem(itemId, tr) {
   const select = tr.querySelector('[data-role="match"]');
   const newName = tr.querySelector('[data-role="new-name"]').value;
+  const priceInput = tr.querySelector('[data-role="price"]');
+  const unitPrice = priceInput && priceInput.value !== '' ? Number(priceInput.value) : undefined;
   const body = select.value
-    ? { action: 'match', product_id: Number(select.value) }
-    : { action: 'new_product', name: newName };
+    ? { action: 'match', product_id: Number(select.value), unit_price: unitPrice }
+    : { action: 'new_product', name: newName, unit_price: unitPrice };
   await api(`/api/receipts/${currentReceipt.id}/items/${itemId}/resolve`, { method: 'POST', body: JSON.stringify(body) });
 }
 
@@ -1205,8 +1208,21 @@ function renderProducts(products) {
     const trendArrow = trendClass === 'up' ? '↑' : trendClass === 'down' ? '↓' : '→';
     const barPct = Math.min(100, Math.max(4, (p.current_stock / Math.max(1, p.targetStock || p.current_stock || 1)) * 100));
     const barColor = p.needsReorder ? (p.current_stock === 0 ? 'var(--red)' : 'var(--amber)') : 'var(--green)';
+    const DEFAULT_MARGIN_PCT = 30; // assumed margin until a real cost is scanned
+    const price = Number(p.unit_price) || 0;
     const cost = Number(p.cost_price) || 0;
-    const marginPct = p.unit_price > 0 ? (((p.unit_price - cost) / p.unit_price) * 100).toFixed(0) : '—';
+    const hasRealCost = cost > 0;
+    let marginPct = '—';
+    if (price > 0) {
+      if (hasRealCost) {
+        const dollars = price - cost;
+        const pct = ((dollars / price) * 100).toFixed(0);
+        marginPct = `$${dollars.toFixed(2)} (${pct}%)`;
+      } else {
+        const estDollars = price * (DEFAULT_MARGIN_PCT / 100);
+        marginPct = `$${estDollars.toFixed(2)} est.`;
+      }
+    }
 
     const tr = document.createElement('tr');
     tr.dataset.productId = p.id;
@@ -1221,8 +1237,10 @@ function renderProducts(products) {
       <td data-label="Demand"><span class="trend ${trendClass}">${trendArrow} ${p.forecastPerDay.toFixed(2)}/day</span></td>
       <td data-label="Status">${badge}</td>
       <td data-label="Lead time">${p.lead_time_days}d</td>
-      <td class="view-mode" data-label="Cost / Margin">$${cost.toFixed(2)} <span class="muted">(${marginPct}${marginPct === '—' ? '' : '%'})</span></td>
-      <td class="edit-mode" data-label="Cost / Margin" style="display:none"><input type="number" data-role="edit-cost" value="${cost}" step="0.01" style="width:80px"></td>
+      <td class="view-mode" data-label="Price">$${price.toFixed(2)}</td>
+      <td class="edit-mode" data-label="Price" style="display:none"><input type="number" data-role="edit-price" value="${price}" step="0.01" style="width:80px"></td>
+      <td class="view-mode" data-label="Margin">${marginPct}</td>
+      <td class="edit-mode" data-label="Margin" style="display:none"><span class="muted">auto</span></td>
       <td class="row-actions">
         <button class="btn small secondary view-mode" onclick="editProduct(${p.id})">Edit</button>
         <button class="btn small" style="display:none" onclick="saveProduct(${p.id}, this)">Save</button>
@@ -1252,14 +1270,14 @@ async function saveProduct(id, btn) {
   const tr = document.querySelector(`tr[data-product-id="${id}"]`);
   const newStock = Number(tr.querySelector('[data-role="edit-stock"]').value);
   const newCategory = tr.querySelector('[data-role="edit-category"]').value.trim();
-  const newCost = Number(tr.querySelector('[data-role="edit-cost"]').value);
+  const newPrice = Number(tr.querySelector('[data-role="edit-price"]').value);
   if (Number.isNaN(newStock) || newStock < 0) { alert('Enter a valid stock number.'); return; }
   if (!newCategory) { alert('Category can\'t be empty.'); return; }
-  if (Number.isNaN(newCost) || newCost < 0) { alert('Enter a valid cost.'); return; }
+  if (Number.isNaN(newPrice) || newPrice < 0) { alert('Enter a valid price.'); return; }
   btn.disabled = true;
   btn.textContent = '…';
   try {
-    await api(`/api/products/${id}`, { method: 'PUT', body: JSON.stringify({ current_stock: newStock, category: newCategory, cost_price: newCost }) });
+    await api(`/api/products/${id}`, { method: 'PUT', body: JSON.stringify({ current_stock: newStock, category: newCategory, unit_price: newPrice }) });
     await loadProducts();
   } catch (err) {
     alert(err.message);
