@@ -133,3 +133,14 @@ CREATE INDEX idx_receipt_items_receipt ON receipt_items(receipt_id);
 CREATE INDEX idx_receipt_items_company ON receipt_items(company_id);
 CREATE INDEX idx_sales_log_product ON sales_log(product_id);
 CREATE INDEX idx_sales_log_company ON sales_log(company_id);
+
+CREATE TABLE assistant_messages (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  company_id    INTEGER NOT NULL,
+  role          TEXT NOT NULL,
+  message       TEXT NOT NULL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY (company_id) REFERENCES companies(id)
+);
+
+CREATE INDEX idx_assistant_messages_company ON assistant_messages(company_id, created_at);
