@@ -35,6 +35,31 @@
 // one shared D1 database, with company_id as the wall between tenants.
 // ─────────────────────────────────────────────────────────────────────────
 
+// ─── D1 migration required for the AI Business Assistant ─────────────────
+// Run once, e.g.: wrangler d1 execute <your-db-name> --command "..."
+//
+// CREATE TABLE IF NOT EXISTS assistant_messages (
+//   id INTEGER PRIMARY KEY AUTOINCREMENT,
+//   company_id INTEGER NOT NULL,
+//   role TEXT NOT NULL,        -- 'user' | 'assistant'
+//   message TEXT NOT NULL,
+//   created_at TEXT NOT NULL DEFAULT (datetime('now'))
+// );
+// CREATE INDEX IF NOT EXISTS idx_assistant_messages_company
+//   ON assistant_messages(company_id, created_at);
+
+// ─── D1 migration required for cost_price + the AI report/view builder ────
+// Run these against your EXISTING remote DB — do NOT re-run schema.sql,
+// it DROPs every table. Replace <your-db-name> with your D1 database name.
+//
+//   wrangler d1 execute <your-db-name> --remote --command "ALTER TABLE products ADD COLUMN cost_price REAL DEFAULT 0;"
+//
+//   wrangler d1 execute <your-db-name> --remote --command "CREATE TABLE IF NOT EXISTS saved_views (id INTEGER PRIMARY KEY AUTOINCREMENT, company_id INTEGER NOT NULL, name TEXT NOT NULL, spec_json TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT (datetime('now')), FOREIGN KEY (company_id) REFERENCES companies(id));"
+//
+//   wrangler d1 execute <your-db-name> --remote --command "CREATE INDEX IF NOT EXISTS idx_saved_views_company ON saved_views(company_id, created_at);"
+//
+// (Drop --remote to run against your local/dev D1 instead.)
+
 export interface Env {
   DB: D1Database;
   SESSION_SECRET: string;      // HMAC key for signing session tokens — set with `wrangler secret put SESSION_SECRET`
@@ -199,7 +224,7 @@ function diceSimilarity(a: string, b: string): number {
 
 type ProductRow = {
   id: number; company_id: number; name: string; normalized_name: string; category: string;
-  unit_price: number; current_stock: number; lead_time_days: number;
+  unit_price: number; cost_price: number; current_stock: number; lead_time_days: number;
   safety_z: number; demand_level: number; demand_trend: number;
   demand_variance: number; last_sale_date: string | null;
 };
@@ -351,6 +376,310 @@ async function callGemmaText(env: Env, prompt: string): Promise<string> {
   const data = await res.json() as { candidates: Array<{ content: { parts: Array<{ text?: string; thought?: boolean }> } }> };
   const parts = data.candidates?.[0]?.content?.parts ?? [];
   return parts.find((p) => !p.thought && p.text)?.text?.trim() ?? '';
+}
+
+// ─── AI Business Assistant ──────────────────────────────────────────────
+// A chat interface over the owner's OWN data — best sellers, what's
+// overstocked, category trends, expansion ideas. Deliberately read-only:
+// it reasons over a pre-computed snapshot and never touches `products`
+// itself, same "human stays in the loop" spirit as auto-reorder.
+
+// Pulls exactly the numbers the assistant is allowed to reason about. The
+// LLM never gets raw SQL access — only this pre-computed, already-scoped
+// summary — so it can't invent or leak figures from nowhere or from
+// another tenant.
+async function buildBusinessSnapshot(env: Env, companyId: number) {
+  const { results: products } = await env.DB.prepare(
+    'SELECT * FROM products WHERE company_id = ? AND archived = 0'
+  ).bind(companyId).all<ProductRow>();
+
+  const cutoff30 = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+  const cutoff90 = new Date(Date.now() - 90 * 86400000).toISOString().slice(0, 10);
+
+  const { results: sales30 } = await env.DB.prepare(
+    `SELECT p.id, p.name, p.category, SUM(sl.qty) AS qty_sold, SUM(sl.qty * p.unit_price) AS revenue
+     FROM sales_log sl JOIN products p ON p.id = sl.product_id
+     WHERE sl.company_id = ? AND sl.sale_date >= ?
+     GROUP BY p.id ORDER BY qty_sold DESC`
+  ).bind(companyId, cutoff30).all<{ id: number; name: string; category: string; qty_sold: number; revenue: number }>();
+
+  const { results: sales90 } = await env.DB.prepare(
+    `SELECT p.id, SUM(sl.qty) AS qty_sold
+     FROM sales_log sl JOIN products p ON p.id = sl.product_id
+     WHERE sl.company_id = ? AND sl.sale_date >= ?
+     GROUP BY p.id`
+  ).bind(companyId, cutoff90).all<{ id: number; qty_sold: number }>();
+
+  const sold90Ids = new Set((sales90 ?? []).map((s) => s.id));
+  const withRec = (products ?? []).map((p) => ({ ...p, ...computeRecommendation(p) }));
+
+  const lowStock = withRec.filter((p) => p.needsReorder);
+  // "Overstocked": plenty of stock, but demand is weak or flat — candidates
+  // to buy less of. daysOfStockLeft can be Infinity for zero-demand items.
+  const overstocked = withRec
+    .filter((p) => p.current_stock > 0 && (p.daysOfStockLeft === Infinity || p.daysOfStockLeft > 90))
+    .sort((a, b) => b.current_stock - a.current_stock)
+    .slice(0, 10);
+  const deadStock = (products ?? []).filter((p) => !sold90Ids.has(p.id) && p.current_stock > 0);
+
+  const catTotals: Record<string, number> = {};
+  const catRevenue: Record<string, number> = {};
+  for (const s of sales30 ?? []) {
+    catTotals[s.category] = (catTotals[s.category] || 0) + s.qty_sold;
+    catRevenue[s.category] = (catRevenue[s.category] || 0) + s.revenue;
+  }
+  const topCategories = Object.entries(catTotals)
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 8)
+    .map(([category, qty]) => ({ category, qty, revenue: Math.round(catRevenue[category] || 0) }));
+
+  const trendingUp = withRec.filter((p) => p.demand_trend > 0.05).sort((a, b) => b.demand_trend - a.demand_trend).slice(0, 5);
+  const trendingDown = withRec.filter((p) => p.demand_trend < -0.05).sort((a, b) => a.demand_trend - b.demand_trend).slice(0, 5);
+
+  return {
+    productCount: products?.length ?? 0,
+    topSellers30d: (sales30 ?? []).slice(0, 10),
+    topCategories30d: topCategories,
+    lowStock: lowStock.map((p) => ({ name: p.name, category: p.category, current_stock: p.current_stock, days_left: p.daysOfStockLeft })),
+    overstocked: overstocked.map((p) => ({ name: p.name, category: p.category, current_stock: p.current_stock, days_left: p.daysOfStockLeft === Infinity ? null : p.daysOfStockLeft })),
+    deadStock90d: deadStock.map((p) => ({ name: p.name, category: p.category, current_stock: p.current_stock })),
+    trendingUp: trendingUp.map((p) => ({ name: p.name, trend: p.demand_trend.toFixed(2) })),
+    trendingDown: trendingDown.map((p) => ({ name: p.name, trend: p.demand_trend.toFixed(2) })),
+  };
+}
+
+// Turns the snapshot into short, labeled lines the model can cite directly
+// instead of a raw JSON blob — cuts down on the model paraphrasing numbers
+// wrong, and only includes sections that actually have data.
+function formatSnapshotForPrompt(s: Awaited<ReturnType<typeof buildBusinessSnapshot>>): string {
+  const lines: string[] = [`Total active products: ${s.productCount}`];
+
+  if (s.topSellers30d.length) {
+    lines.push('\nTOP SELLERS (last 30 days):');
+    s.topSellers30d.forEach((p, i) => lines.push(`${i + 1}. ${p.name} (${p.category}) — ${p.qty_sold} sold, $${Math.round(p.revenue)} revenue`));
+  }
+  if (s.topCategories30d.length) {
+    lines.push('\nTOP CATEGORIES (last 30 days):');
+    s.topCategories30d.forEach((c) => lines.push(`- ${c.category}: ${c.qty} units, $${c.revenue} revenue`));
+  }
+  if (s.lowStock.length) {
+    lines.push('\nLOW STOCK / NEEDS REORDER:');
+    s.lowStock.forEach((p) => lines.push(`- ${p.name} (${p.category}): ${p.current_stock} on hand, ~${p.days_left === Infinity ? 'unknown' : p.days_left.toFixed(1)} days left`));
+  }
+  if (s.overstocked.length) {
+    lines.push('\nOVERSTOCKED (high stock, slow demand — candidates to buy less of):');
+    s.overstocked.forEach((p) => lines.push(`- ${p.name} (${p.category}): ${p.current_stock} on hand, ${p.days_left === null ? 'no recent demand' : p.days_left.toFixed(0) + ' days of stock left'}`));
+  }
+  if (s.deadStock90d.length) {
+    lines.push('\nNO SALES IN 90+ DAYS (still in stock):');
+    s.deadStock90d.forEach((p) => lines.push(`- ${p.name} (${p.category}): ${p.current_stock} on hand`));
+  }
+  if (s.trendingUp.length) {
+    lines.push('\nTRENDING UP:');
+    s.trendingUp.forEach((p) => lines.push(`- ${p.name} (trend +${p.trend}/day)`));
+  }
+  if (s.trendingDown.length) {
+    lines.push('\nTRENDING DOWN:');
+    s.trendingDown.forEach((p) => lines.push(`- ${p.name} (trend ${p.trend}/day)`));
+  }
+  return lines.join('\n');
+}
+
+const ASSISTANT_SYSTEM_PROMPT = `You are the Auto Stockers business assistant. You help a small business owner make inventory and buying decisions.
+
+Rules:
+1. Use ONLY the BUSINESS DATA block below as your source of numbers. Never invent a product name, quantity, or dollar figure that isn't in it.
+2. If the data needed to answer isn't in the BUSINESS DATA block, say so plainly rather than guessing.
+3. When asked "what should I buy less of" or similar, point to items in OVERSTOCKED or NO SALES IN 90+ DAYS, and explain why using the numbers given.
+4. When asked about expansion ("what should I expand into"), reason from TOP CATEGORIES and TRENDING UP — suggest categories or adjacent products a shop like this could add, but be explicit that this is a suggestion based on their own sales pattern, not a guarantee.
+5. Be direct and concise — a busy owner is skimming this, not reading a report. Prefer short paragraphs or a few bullet points over long prose.
+6. You may reference recent conversation to resolve follow-ups like "why?" or "how much of that", but never treat prior conversation as a source of new facts.
+7. Do not give legal, tax, or accounting advice — stick to inventory and product-mix reasoning.`;
+
+async function callAssistantLLM(env: Env, snapshotText: string, history: string, userMessage: string): Promise<string> {
+  const prompt =
+    ASSISTANT_SYSTEM_PROMPT +
+    '\n\nBUSINESS DATA:\n' + snapshotText +
+    (history ? '\n\nRECENT CONVERSATION:\n' + history : '') +
+    '\n\nOwner: ' + userMessage +
+    '\nAssistant:';
+  const reply = await callGemmaText(env, prompt);
+  return reply || "Sorry, I couldn't put that together right now — try again in a moment.";
+}
+
+// ─── AI Report/View Builder ─────────────────────────────────────────────
+// Owner describes a report in plain English ("products where I'll run out
+// before the vendor's lead time"). The AI's ONLY job is to translate that
+// into a JSON "spec" — never SQL. Every field name in the spec is checked
+// against QUERY_WHITELIST before it touches a query; anything not on the
+// list is rejected outright. company_id is bound by this code, never by
+// the AI or the client, so a spec can't reach across tenants even in
+// principle — same isolation guarantee as every other query in this file.
+
+type ViewFilter = { field: string; op: '>' | '<' | '>=' | '<=' | '=' | '!='; value: number | string };
+
+type ViewSpec = {
+  mode: 'single' | 'compare';
+  columns: string[];
+  sort: { field: string; direction: 'asc' | 'desc' } | null;
+  limit: number;
+  filters: ViewFilter[];                              // used when mode === 'single'
+  groups: Array<{ label: string; filters: ViewFilter[] }>; // used when mode === 'compare'
+};
+
+// Every key here is a field the AI (and the client) is allowed to
+// reference. `column` is the physical column name; `expr` is used instead
+// for computed fields, and is written by US, never by the AI — so even a
+// "computed" field can't be used to inject arbitrary SQL.
+const QUERY_WHITELIST: Record<string, { expr: string; label: string; filterable: boolean }> = {
+  name:            { expr: 'name',            label: 'Product name',        filterable: false },
+  category:        { expr: 'category',        label: 'Category',            filterable: true },
+  current_stock:   { expr: 'current_stock',    label: 'Stock on hand',       filterable: true },
+  unit_price:      { expr: 'unit_price',       label: 'Sell price',          filterable: true },
+  cost_price:      { expr: 'cost_price',       label: 'Cost price',          filterable: true },
+  lead_time_days:  { expr: 'lead_time_days',   label: 'Vendor lead time (days)', filterable: true },
+  demand_level:    { expr: 'demand_level',     label: 'Demand (units/day)',  filterable: true },
+  demand_trend:    { expr: 'demand_trend',     label: 'Demand trend',        filterable: true },
+  margin_pct:      { expr: '(CASE WHEN unit_price > 0 THEN ROUND((unit_price - cost_price) / unit_price * 100, 1) ELSE NULL END)', label: 'Margin %', filterable: true },
+  margin_dollars:  { expr: 'ROUND(unit_price - cost_price, 2)', label: 'Margin $', filterable: true },
+  days_of_stock:   { expr: '(CASE WHEN demand_level > 0.001 THEN ROUND(current_stock / demand_level, 1) ELSE NULL END)', label: 'Days of stock left', filterable: true },
+};
+const ALLOWED_OPS = new Set(['>', '<', '>=', '<=', '=', '!=']);
+const MAX_VIEW_ROWS = 200;
+const MAX_COMPARE_GROUPS = 3;
+
+function whitelistDescriptionForPrompt(): string {
+  return Object.entries(QUERY_WHITELIST)
+    .map(([key, v]) => `- ${key}: ${v.label}${v.filterable ? '' : ' (not filterable/sortable)'}`)
+    .join('\n');
+}
+
+// Shared by both single and compare mode — validates one filters array
+// against the whitelist, dropping (never coercing) anything invalid.
+function validateFilters(rawFilters: any): ViewFilter[] {
+  const filters: ViewFilter[] = [];
+  if (Array.isArray(rawFilters)) {
+    for (const f of rawFilters) {
+      if (!f || typeof f.field !== 'string' || !QUERY_WHITELIST[f.field] || !QUERY_WHITELIST[f.field].filterable) continue;
+      if (typeof f.op !== 'string' || !ALLOWED_OPS.has(f.op)) continue;
+      if (typeof f.value !== 'number' && typeof f.value !== 'string') continue;
+      filters.push({ field: f.field, op: f.op, value: f.value });
+    }
+  }
+  return filters;
+}
+
+// Rejects anything not on the whitelist — this is the actual security
+// boundary, not the prompt. The prompt just makes the AI's job easier.
+function validateViewSpec(raw: any): { spec: ViewSpec | null; error: string | null } {
+  if (!raw || typeof raw !== 'object') return { spec: null, error: 'Could not understand that request.' };
+
+  const columns = Array.isArray(raw.columns) ? raw.columns.filter((c: any) => typeof c === 'string') : [];
+  const validColumns = columns.filter((c: string) => QUERY_WHITELIST[c]);
+  if (validColumns.length === 0) return { spec: null, error: 'No recognized fields in that request — try naming specific product attributes like stock, price, or category.' };
+
+  let sort: ViewSpec['sort'] = null;
+  if (raw.sort && typeof raw.sort.field === 'string' && QUERY_WHITELIST[raw.sort.field]?.filterable) {
+    const direction = raw.sort.direction === 'asc' ? 'asc' : 'desc';
+    sort = { field: raw.sort.field, direction };
+  }
+  const limit = Math.min(MAX_VIEW_ROWS, Math.max(1, Number(raw.limit) || 50));
+
+  if (raw.mode === 'compare') {
+    const rawGroups = Array.isArray(raw.groups) ? raw.groups.slice(0, MAX_COMPARE_GROUPS) : [];
+    const groups = rawGroups
+      .filter((g: any) => g && typeof g.label === 'string')
+      .map((g: any) => ({ label: g.label.trim().slice(0, 40) || 'Group', filters: validateFilters(g.filters) }));
+    if (groups.length < 2) {
+      return { spec: null, error: 'Could not split that into two groups to compare — try naming the two things you want side by side, e.g. "hardware vs software".' };
+    }
+    return { spec: { mode: 'compare', columns: validColumns, groups, sort, limit, filters: [] }, error: null };
+  }
+
+  const filters = validateFilters(raw.filters);
+  return { spec: { mode: 'single', columns: validColumns, filters, sort, limit, groups: [] }, error: null };
+}
+
+// Turns a validated set of filters into a parameterized WHERE clause.
+// company_id is bound here, by server code, always — the spec never
+// carries it and never could, since it's not a whitelisted field.
+function buildFilteredQuery(columns: string[], filters: ViewFilter[], sort: ViewSpec['sort'], limit: number, companyId: number): { sql: string; params: any[] } {
+  const selectCols = columns.map((c) => `${QUERY_WHITELIST[c].expr} AS ${c}`).join(', ');
+  const params: any[] = [companyId];
+  let sql = `SELECT ${selectCols} FROM products WHERE company_id = ? AND archived = 0`;
+
+  for (const f of filters) {
+    sql += ` AND ${QUERY_WHITELIST[f.field].expr} ${f.op} ?`;
+    params.push(f.value);
+  }
+  if (sort) sql += ` ORDER BY ${QUERY_WHITELIST[sort.field].expr} ${sort.direction === 'asc' ? 'ASC' : 'DESC'}`;
+  sql += ` LIMIT ?`;
+  params.push(limit);
+
+  return { sql, params };
+}
+
+async function callViewSpecLLM(env: Env, userRequest: string): Promise<any> {
+  const prompt = `You turn a small business owner's plain-English report request into a JSON query spec over a PRODUCTS table.
+
+AVAILABLE FIELDS (use ONLY these — never invent a field name):
+${whitelistDescriptionForPrompt()}
+
+There are two possible shapes to return. Pick whichever matches what the owner asked for.
+
+1) A single filtered/sorted list — use this by default:
+{
+  "mode": "single",
+  "columns": ["name", "current_stock", "days_of_stock"],
+  "filters": [{ "field": "current_stock", "op": "<", "value": 10 }],
+  "sort": { "field": "current_stock", "direction": "asc" },
+  "limit": 50
+}
+
+2) A side-by-side COMPARISON of two or three groups — use this whenever the owner names two or more distinct sets of products they want to see separately, however they phrase it: "X vs Y", "X compared to Y", "my X and my Y", "split by category", "X versus Y". The connecting word doesn't matter ("vs", "and", "compared to") — what matters is whether the owner is naming distinct groups they want side by side, rather than describing several conditions on ONE list. "hardware and software" = two groups (compare mode). "items under 10 in stock and low margin" = one list with two conditions (single mode, two filters). Each group is just a label plus its own filters over the SAME fields:
+{
+  "mode": "compare",
+  "columns": ["name", "demand_level"],
+  "groups": [
+    { "label": "Hardware", "filters": [{ "field": "category", "op": "!=", "value": "Software" }] },
+    { "label": "Software", "filters": [{ "field": "category", "op": "=", "value": "Software" }] }
+  ],
+  "sort": { "field": "demand_level", "direction": "desc" },
+  "limit": 10
+}
+For compare mode, "limit" applies PER GROUP (e.g. limit 10 means top 10 rows in each group, not 10 total) — keep it modest (5-15) so the two tables stay readable side by side. There is no single "hardware" category field — express "hardware" as everything that ISN'T "Software" (category != "Software"), unless the owner names specific categories, in which case list those categories explicitly instead.
+
+Rules:
+- "columns" must be a non-empty array of field keys from the list above. Always include "name" unless the owner clearly doesn't want it. Also always include ONE numeric field (demand_level, current_stock, unit_price, cost_price, margin_pct, margin_dollars, or days_of_stock) so the report can be charted — default to "demand_level" if the request doesn't make a metric obvious, unless the owner explicitly asked for only names/categories with no numbers.
+- filters' op must be one of > < >= <= = !=.
+- "sort" is optional.
+- If the request doesn't map to these fields at all, return {"mode": "single", "columns": [], "filters": [], "sort": null, "limit": 50}.
+
+Owner's request: "${userRequest}"`;
+  const raw = await callGemmaText(env, prompt);
+  const clean = raw.replace(/```json|```/g, '').trim();
+  try { return JSON.parse(clean); } catch { return {}; }
+}
+
+// Executes a validated spec and returns a uniform shape: single mode
+// returns { columns, rows }, compare mode returns { groups: [{ label,
+// columns, rows }] } — the frontend branches on which key is present.
+async function runViewSpec(env: Env, spec: ViewSpec, companyId: number) {
+  const columnMeta = spec.columns.map((c) => ({ key: c, label: QUERY_WHITELIST[c].label }));
+
+  if (spec.mode === 'compare') {
+    const groups = [];
+    for (const g of spec.groups) {
+      const { sql, params } = buildFilteredQuery(spec.columns, g.filters, spec.sort, spec.limit, companyId);
+      const { results } = await env.DB.prepare(sql).bind(...params).all();
+      groups.push({ label: g.label, columns: columnMeta, rows: results ?? [] });
+    }
+    return { groups };
+  }
+
+  const { sql, params } = buildFilteredQuery(spec.columns, spec.filters, spec.sort, spec.limit, companyId);
+  const { results } = await env.DB.prepare(sql).bind(...params).all();
+  return { columns: columnMeta, rows: results ?? [] };
 }
 
 // ─── Google Calendar integration (per-company) ─────────────────────────────
@@ -875,7 +1204,7 @@ export default {
 
             // POST /api/products — manual add
       if (path === '/api/products' && req.method === 'POST') {
-        const b = await req.json() as { name: string; category?: string; unit_price?: number; current_stock?: number; lead_time_days?: number };
+        const b = await req.json() as { name: string; category?: string; unit_price?: number; cost_price?: number; current_stock?: number; lead_time_days?: number };
         if (!b.name?.trim()) return json({ error: 'name required' }, 400);
         let category = b.category?.trim();
         if (!category) {
@@ -883,9 +1212,9 @@ export default {
           category = guesses['new'] || 'General';
         }
         const row = await env.DB.prepare(
-          `INSERT INTO products (company_id, name, normalized_name, category, unit_price, current_stock, lead_time_days)
-           VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING *`
-        ).bind(companyId, b.name.trim(), normalizeText(b.name), category, b.unit_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
+          `INSERT INTO products (company_id, name, normalized_name, category, unit_price, cost_price, current_stock, lead_time_days)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING *`
+        ).bind(companyId, b.name.trim(), normalizeText(b.name), category, b.unit_price || 0, b.cost_price || 0, b.current_stock || 0, b.lead_time_days || 3).first();
         return json(row, 201);
       }
 
@@ -893,15 +1222,15 @@ export default {
       const productMatch = path.match(/^\/api\/products\/(\d+)$/);
       if (productMatch && req.method === 'PUT') {
         const id = Number(productMatch[1]);
-        const b = await req.json() as Partial<{ name: string; category: string; unit_price: number; current_stock: number; lead_time_days: number; archived: boolean }>;
+        const b = await req.json() as Partial<{ name: string; category: string; unit_price: number; cost_price: number; current_stock: number; lead_time_days: number; archived: boolean }>;
         const existing = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first<ProductRow>();
         if (!existing) return json({ error: 'not found' }, 404);
         const name = b.name ?? existing.name;
         await env.DB.prepare(
-          `UPDATE products SET name=?, normalized_name=?, category=?, unit_price=?, current_stock=?, lead_time_days=?, archived=? WHERE id=? AND company_id=?`
+          `UPDATE products SET name=?, normalized_name=?, category=?, unit_price=?, cost_price=?, current_stock=?, lead_time_days=?, archived=? WHERE id=? AND company_id=?`
         ).bind(
           name, normalizeText(name), b.category ?? existing.category, b.unit_price ?? existing.unit_price,
-          b.current_stock ?? existing.current_stock, b.lead_time_days ?? existing.lead_time_days,
+          b.cost_price ?? existing.cost_price, b.current_stock ?? existing.current_stock, b.lead_time_days ?? existing.lead_time_days,
           b.archived ? 1 : 0, id, companyId
         ).run();
         const row = await env.DB.prepare('SELECT * FROM products WHERE id = ? AND company_id = ?').bind(id, companyId).first();
@@ -1042,6 +1371,116 @@ export default {
           'SELECT sale_date, qty FROM sales_log WHERE product_id = ? AND company_id = ? ORDER BY sale_date ASC'
         ).bind(id, companyId).all();
         return json(results);
+      }
+
+      // POST /api/views/generate — turns a plain-English report request
+      // into a validated, whitelisted query and runs it immediately (not
+      // saved). This is the "show me..." path — instant, disposable.
+      // Supports two shapes: a single filtered list, or a side-by-side
+      // comparison of 2-3 groups (e.g. "hardware vs software").
+      if (path === '/api/views/generate' && req.method === 'POST') {
+        const body = await req.json() as { request?: string };
+        const userRequest = (body.request || '').trim().slice(0, 300);
+        if (!userRequest) return json({ error: 'request required' }, 400);
+
+        const rawSpec = await callViewSpecLLM(env, userRequest);
+        const { spec, error } = validateViewSpec(rawSpec);
+        if (error || !spec) return json({ error: error || 'Could not build a report from that.' }, 422);
+
+        const result = await runViewSpec(env, spec, companyId);
+        return json({ spec, ...result });
+      }
+
+      // POST /api/views — save a spec (already generated/validated) under a
+      // name so it shows up as a permanent report the owner can rerun.
+      if (path === '/api/views' && req.method === 'POST') {
+        const body = await req.json() as { name?: string; spec?: any };
+        const name = (body.name || '').trim().slice(0, 80);
+        if (!name) return json({ error: 'name required' }, 400);
+        const { spec, error } = validateViewSpec(body.spec);
+        if (error || !spec) return json({ error: error || 'Invalid report spec' }, 422);
+
+        const row = await env.DB.prepare(
+          `INSERT INTO saved_views (company_id, name, spec_json) VALUES (?, ?, ?) RETURNING *`
+        ).bind(companyId, name, JSON.stringify(spec)).first();
+        return json(row, 201);
+      }
+
+      // GET /api/views — list this company's saved reports
+      if (path === '/api/views' && req.method === 'GET') {
+        const { results } = await env.DB.prepare(
+          'SELECT id, name, spec_json, created_at FROM saved_views WHERE company_id = ? ORDER BY created_at DESC'
+        ).bind(companyId).all();
+        return json(results ?? []);
+      }
+
+      // GET /api/views/:id/run — re-run a saved report against current data
+      const viewRunMatch = path.match(/^\/api\/views\/(\d+)\/run$/);
+      if (viewRunMatch && req.method === 'GET') {
+        const id = Number(viewRunMatch[1]);
+        const saved = await env.DB.prepare('SELECT * FROM saved_views WHERE id = ? AND company_id = ?').bind(id, companyId).first<any>();
+        if (!saved) return json({ error: 'not found' }, 404);
+
+        // Re-validate on every run, not just at save time — if the
+        // whitelist ever changes, a stale saved spec degrades safely
+        // instead of running raw.
+        const { spec, error } = validateViewSpec(JSON.parse(saved.spec_json));
+        if (error || !spec) return json({ error: 'This saved report is no longer valid — try recreating it.' }, 422);
+
+        const result = await runViewSpec(env, spec, companyId);
+        return json({ name: saved.name, ...result });
+      }
+
+      // DELETE /api/views/:id
+      const viewDeleteMatch = path.match(/^\/api\/views\/(\d+)$/);
+      if (viewDeleteMatch && req.method === 'DELETE') {
+        const id = Number(viewDeleteMatch[1]);
+        await env.DB.prepare('DELETE FROM saved_views WHERE id = ? AND company_id = ?').bind(id, companyId).run();
+        return json({ ok: true });
+      }
+
+      // POST /api/assistant/chat — business-analyst chat over this
+      // company's own data (sales, stock, categories, trends). Read-only:
+      // nothing here is auto-applied to inventory, same "human confirms"
+      // philosophy as auto-reorder.
+      if (path === '/api/assistant/chat' && req.method === 'POST') {
+        const body = await req.json() as { message?: string };
+        const message = (body.message || '').trim().slice(0, 1000);
+        if (!message) return json({ error: 'message required' }, 400);
+
+        const { results: recent } = await env.DB.prepare(
+          `SELECT role, message FROM assistant_messages WHERE company_id = ? ORDER BY id DESC LIMIT 8`
+        ).bind(companyId).all<{ role: string; message: string }>();
+        const history = (recent ?? []).reverse()
+          .map((m) => `${m.role === 'user' ? 'Owner' : 'Assistant'}: ${m.message}`)
+          .join('\n');
+
+        const snapshot = await buildBusinessSnapshot(env, companyId);
+        const snapshotText = formatSnapshotForPrompt(snapshot);
+        const reply = await callAssistantLLM(env, snapshotText, history, message);
+
+        await env.DB.prepare('INSERT INTO assistant_messages (company_id, role, message) VALUES (?, ?, ?)')
+          .bind(companyId, 'user', message).run();
+        await env.DB.prepare('INSERT INTO assistant_messages (company_id, role, message) VALUES (?, ?, ?)')
+          .bind(companyId, 'assistant', reply).run();
+
+        return json({ reply });
+      }
+
+            // GET /api/assistant/chat — load recent history for the chat panel
+      if (path === '/api/assistant/chat' && req.method === 'GET') {
+        const { results } = await env.DB.prepare(
+          `SELECT role, message, created_at FROM assistant_messages WHERE company_id = ? ORDER BY id DESC LIMIT 30`
+        ).bind(companyId).all();
+        return json((results ?? []).reverse());
+      }
+
+      // DELETE /api/assistant/chat — wipes this company's assistant history.
+      // Called on every fresh page load/login so each session starts clean
+      // instead of resuming an old conversation.
+      if (path === '/api/assistant/chat' && req.method === 'DELETE') {
+        await env.DB.prepare('DELETE FROM assistant_messages WHERE company_id = ?').bind(companyId).run();
+        return json({ ok: true });
       }
 
       return json({ error: 'Not found' }, 404);
